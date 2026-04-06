@@ -1,0 +1,19 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Python: Test Viz",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/scripts/test_viz.py",
+      "console": "integratedTerminal",
+      "args": [
+        "--data_root",
+        "~/mit/data/VLA-3D/VLA-3D_dataset",
+        "--dataset",
+        "scannet"
+      ],
+      "cwd": "${workspaceFolder}"
+    }
+  ]
+}

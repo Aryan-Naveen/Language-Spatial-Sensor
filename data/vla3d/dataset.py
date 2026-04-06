@@ -95,7 +95,9 @@ class VLA3DScene:
         statements: list[ReferentialStatement] = []
 
         for region_stmts in data["regions"].values():
-            for text, entries in region_stmts.items():
+            for text, entries in region_stmts.items():                
+                if text == 'region':
+                    continue
                 for entry in entries:
                     target_id = int(entry["target_index"])
                     anchors = entry.get("anchors", {})
@@ -112,6 +114,7 @@ class VLA3DScene:
                         ambiguity=ambiguity,
                         anchor_object_id=anchor_ids,
                         relation=entry.get("relation"),
+                        region=""
                     ))
 
         return statements
@@ -124,12 +127,39 @@ class VLA3DScene:
         return o3d.io.read_point_cloud(str(self._file("pc_result.ply")))
 
     def load_object_split(self) -> np.ndarray:
-        """Per-point object ID assignments."""
-        return np.load(str(self._file("object_split.npy")))
+        """Per-point object ID assignments (shape: N,).
+
+        The raw file stores a compact (K, 2) array where each row is
+        [object_id, cumulative_end_index], meaning points are laid out
+        contiguously per object.  This method expands that into a flat
+        per-point label array so callers can use it as a boolean mask.
+        """
+        raw = np.load(str(self._file("object_split.npy")))
+        if raw.ndim == 2 and raw.shape[1] == 2:
+            n_points = int(raw[-1, 1])
+            per_point = np.empty(n_points, dtype=np.int64)
+            start = 0
+            for obj_id, end in raw:
+                per_point[start:int(end)] = int(obj_id)
+                start = int(end)
+            return per_point
+        return raw
 
     def load_region_split(self) -> np.ndarray:
-        """Per-point region ID assignments."""
-        return np.load(str(self._file("region_split.npy")))
+        """Per-point region ID assignments (shape: N,).
+
+        Expands the same compact (K, 2) format as load_object_split.
+        """
+        raw = np.load(str(self._file("region_split.npy")))
+        if raw.ndim == 2 and raw.shape[1] == 2:
+            n_points = int(raw[-1, 1])
+            per_point = np.empty(n_points, dtype=np.int64)
+            start = 0
+            for obj_id, end in raw:
+                per_point[start:int(end)] = int(obj_id)
+                start = int(end)
+            return per_point
+        return raw
 
 
 class VLA3DDataset:
