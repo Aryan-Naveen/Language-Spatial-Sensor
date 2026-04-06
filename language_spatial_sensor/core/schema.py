@@ -47,14 +47,15 @@ class SceneData(BaseModel):
 @dataclass
 class SpatialQuery:
     scene_id: str
-    
+
     scene_graph: SceneGraph
-    pc : np.ndarray
-    
+    pc: np.ndarray           # (N, 3) — target object removed
+    object_split: np.ndarray # (N,)   — per-point object IDs, aligned with pc
+
     language: str
-    
-    target_xyz: np.ndarray      # supervision
-    
+
+    target_xyz: np.ndarray   # supervision
+
     # optional
     anchor_object_ids: list[int] | None = None
     anchor_room_id: int | None = None

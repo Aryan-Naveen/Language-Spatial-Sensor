@@ -44,9 +44,16 @@ class VLA3DScene:
             region_id = int(region_raw["region_id"])
             # compute region centroid from 8-corner bbox
             region_bbox = region_raw.get("region_bbox", [])
+            region_meta: dict = {}
             if region_bbox:
                 corners = np.array(region_bbox)
                 region_pos = corners.mean(axis=0).tolist()
+                region_meta["bbox_x_min"] = float(corners[:, 0].min())
+                region_meta["bbox_x_max"] = float(corners[:, 0].max())
+                region_meta["bbox_y_min"] = float(corners[:, 1].min())
+                region_meta["bbox_y_max"] = float(corners[:, 1].max())
+                region_meta["bbox_z_min"] = float(corners[:, 2].min())
+                region_meta["bbox_z_max"] = float(corners[:, 2].max())
             else:
                 region_pos = [0.0, 0.0, 0.0]
 
@@ -54,11 +61,12 @@ class VLA3DScene:
                 id=region_id,
                 label=region_raw.get("region_name", ""),
                 position=region_pos,
+                metadata=region_meta,
             ))
 
             for obj_raw in region_raw.get("objects", []):
                 obj_id = int(obj_raw["object_id"])
-                label = obj_raw.get("nyu40_label") or obj_raw.get("raw_label", "")
+                label = obj_raw.get("raw_label", "")
                 center = obj_raw.get("center", [0.0, 0.0, 0.0])
 
                 # bbox is 8 corners [[x,y,z], ...]; flatten to 24 floats

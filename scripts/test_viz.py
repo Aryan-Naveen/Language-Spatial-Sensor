@@ -36,6 +36,8 @@ def parse_args() -> argparse.Namespace:
                    help="BEV grid cell size in metres (default: 0.05).")
     p.add_argument("--seed", default=None, type=int,
                    help="Random seed for reproducible sampling.")
+    p.add_argument("--anchor_highlight", action="store_true",
+                   help="Grayscale all objects except those sharing a class with the anchor.")
     return p.parse_args()
 
 
@@ -96,7 +98,7 @@ def main() -> None:
     print(f"PC after target removal: {query.pc.shape[0]:,} points")
 
     # --- BEV render ---------------------------------------------------------
-    fig = render_bev(query, resolution=args.resolution)
+    fig = render_bev(query, resolution=args.resolution, anchor_highlight=args.anchor_highlight)
 
     if args.save:
         fig.savefig(args.save, dpi=150, bbox_inches="tight")

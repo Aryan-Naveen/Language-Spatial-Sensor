@@ -34,12 +34,15 @@ def build_spatial_query(
     )
 
     # 3. Remove target object's points from point cloud
-    masked_pc = points[object_split != target_id]
+    keep = object_split != target_id
+    masked_pc    = points[keep]
+    masked_split = object_split[keep]
 
     return SpatialQuery(
         scene_id=scene_id,
         scene_graph=filtered_graph,
         pc=masked_pc,
+        object_split=masked_split,
         language=statement.text,
         target_xyz=target_xyz,
         anchor_object_ids=statement.anchor_object_id,
