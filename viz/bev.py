@@ -300,6 +300,9 @@ def make_semantic_bev(
 
     image = np.ones((H, W, 3), dtype=np.float32)  # white background
 
+    # Sort points by z ascending so higher-z objects paint over lower-z ones
+    z_order = np.argsort(pc[:, 2])
+
     if highlight_labels is not None:
         # Determine which points belong to a highlighted object
         is_highlight = np.array([
@@ -308,11 +311,12 @@ def make_semantic_bev(
             if int(oid) in id_to_obj else False
             for oid in object_split
         ])
-        # Paint background objects first, highlighted objects on top
-        for mask in (~is_highlight, is_highlight):
-            image[row[mask], col[mask]] = point_colors[mask]
+        # Within each group respect z-order; highlighted group goes on top of background
+        hi_in_z = is_highlight[z_order]
+        for idx in (z_order[~hi_in_z], z_order[hi_in_z]):
+            image[row[idx], col[idx]] = point_colors[idx]
     else:
-        image[row, col] = point_colors
+        image[row[z_order], col[z_order]] = point_colors[z_order]
 
     meta = {"x_min": x_min, "y_min": y_min, "resolution": resolution,
             "width": W, "height": H}
