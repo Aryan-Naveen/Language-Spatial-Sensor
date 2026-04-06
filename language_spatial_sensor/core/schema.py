@@ -1,4 +1,10 @@
+from dataclasses import dataclass, field
+from typing import Any
+import numpy as np
+
 from pydantic import BaseModel
+
+
 
 class ObjectInfo(BaseModel):
     id: int
@@ -26,7 +32,7 @@ class ReferentialStatement(BaseModel):
     ambiguity: int
     
     # optional richer structure
-    anchor_object_id: int | None = None
+    anchor_object_id: list[int] | None = None
     relation: str | None = None
 
 class SceneData(BaseModel):
@@ -37,3 +43,19 @@ class SceneData(BaseModel):
     
     # paths (optional)
     pointcloud_path: str | None = None
+
+@dataclass
+class SpatialQuery:
+    scene_id: str
+    
+    scene_graph: SceneGraph
+    pc : np.ndarray
+    
+    language: str
+    
+    target_xyz: np.ndarray      # supervision
+    
+    # optional
+    anchor_object_ids: list[int] | None = None
+    anchor_room_id: int | None = None
+    metadata: dict = field(default_factory=dict)
