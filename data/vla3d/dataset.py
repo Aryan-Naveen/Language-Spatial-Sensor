@@ -1,4 +1,5 @@
 import json
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -96,14 +97,35 @@ class VLA3DScene:
     # ReferentialStatements
     # ------------------------------------------------------------------
 
+    _NYU40_OTHER = {"otherprop", "otherfurniture", "otherstructure"}
+
+    def _semantic_label(self, metadata: dict) -> str:
+        """Return the semantic bin for an object.
+
+        Uses nyu40_label for most objects; falls back to raw_label for the
+        catch-all nyu40 categories so they aren't collapsed into one bucket.
+        """
+        nyu40 = metadata.get("nyu40_label") or ""
+        if nyu40 in self._NYU40_OTHER:
+            return metadata.get("raw_label") or nyu40
+        return nyu40 or metadata.get("raw_label") or ""
+
     def load_statements(self) -> list[ReferentialStatement]:
         with open(self._file("referential_statements.json")) as f:
             data = json.load(f)
 
+        # Build per-object semantic label and a scene-wide frequency count.
+        scene_graph = self.load_scene_graph()
+        obj_sem: dict[int, str] = {
+            obj.id: self._semantic_label(obj.metadata)
+            for obj in scene_graph.objects
+        }
+        sem_counts: Counter[str] = Counter(obj_sem.values())
+
         statements: list[ReferentialStatement] = []
 
         for region_stmts in data["regions"].values():
-            for text, entries in region_stmts.items():                
+            for text, entries in region_stmts.items():
                 if text == 'region':
                     continue
                 for entry in entries:
@@ -113,8 +135,16 @@ class VLA3DScene:
                     if anchors:
                         anchor_ids = [int(anchor["index"]) for anchor in anchors.values()]
 
-                    # TODO: update the ambiguity definition
-                    ambiguity = 0
+                    # Ambiguity = product over anchors of (# scene objects with
+                    # the same semantic label, excluding the anchor itself).
+                    if not anchor_ids:
+                        ambiguity = 0
+                    else:
+                        ambiguity = 1
+                        for aid in anchor_ids:
+                            sem = obj_sem.get(aid, "")
+                            others = max(sem_counts.get(sem, 1), 0)
+                            ambiguity *= others
 
                     statements.append(ReferentialStatement(
                         text=text,
