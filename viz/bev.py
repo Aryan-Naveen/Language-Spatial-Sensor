@@ -76,6 +76,11 @@ _PALETTE: dict[str, tuple[float, float, float]] = {
 }
 
 
+def _nyu40_label(obj) -> str:
+    """Normalized NYU40 label for a scene-graph object."""
+    return str(obj.metadata.get("nyu40_label", "")).lower().strip()
+
+
 def nyu40_to_color(nyu40_label: str) -> tuple[float, float, float]:
     """Return an RGB color for an NYU40 label. Raises KeyError if not in palette."""
     return _PALETTE[nyu40_label.lower().strip()]
@@ -110,7 +115,7 @@ def fit_floor_ceiling_semantic(
     ceiling_z: float | None = None
 
     for obj in scene_graph.objects:
-        nyu = str(obj.metadata.get("nyu40_label", "")).lower().strip()
+        nyu = _nyu40_label(obj)
         raw = obj.label.lower().strip()
 
         is_floor   = nyu in _FLOOR_NYU40   or raw in _FLOOR_RAW
@@ -171,10 +176,9 @@ def filter_object_points(
     Returns:
         (filtered_pc, filtered_split)
     """
-    # Positive allowlist: only objects whose nyu40_label is in the shared ontology
     valid_ids = np.array([
         obj.id for obj in scene_graph.objects
-        if str(obj.metadata.get("nyu40_label", "")).lower().strip() in VALID_NYU40_LABELS
+        if _nyu40_label(obj) in VALID_NYU40_LABELS
     ], dtype=np.int64)
 
     keep = np.isin(object_split, valid_ids)
@@ -260,7 +264,6 @@ def make_semantic_bev(
             "width": 1, "height": 1,
         }
 
-    # Build object_id → RGB color only for IDs present in this filtered split.
     present_ids = set(int(i) for i in np.unique(object_split))
     id_to_obj = {obj.id: obj for obj in scene_graph.objects}
 
@@ -273,7 +276,7 @@ def make_semantic_bev(
         obj = id_to_obj.get(oid)
         if obj is None:
             return _GRAYSCALE
-        lbl = str(obj.metadata.get("nyu40_label", "")).lower().strip()
+        lbl = _nyu40_label(obj)
         if highlight_labels is not None:
             return _HIGHLIGHT if lbl in highlight_labels else _label_gray(lbl)
         return np.array(nyu40_to_color(lbl), dtype=np.float32)
@@ -281,8 +284,6 @@ def make_semantic_bev(
     id_to_color: dict[int, np.ndarray] = {
         oid: _color_for(oid) for oid in present_ids if oid in id_to_obj
     }
-    # Per-point colors (any point with an unrecognised id gets skipped upstream,
-    # but keep a fallback for -1 / background points just in case)
     default_color = np.array([0.4, 0.4, 0.4], dtype=np.float32)
     point_colors = np.stack([
         id_to_color.get(int(oid), default_color) for oid in object_split
@@ -305,10 +306,8 @@ def make_semantic_bev(
     z_order = np.argsort(pc[:, 2])
 
     if highlight_labels is not None:
-        # Determine which points belong to a highlighted object
         is_highlight = np.array([
-            str(id_to_obj[int(oid)].metadata.get("nyu40_label", "")).lower().strip()
-            in highlight_labels
+            _nyu40_label(id_to_obj[int(oid)]) in highlight_labels
             if int(oid) in id_to_obj else False
             for oid in object_split
         ])
@@ -323,6 +322,44 @@ def make_semantic_bev(
             "width": W, "height": H}
     return image, meta
 
+
+# ---------------------------------------------------------------------------
+# Legend helper
+# ---------------------------------------------------------------------------
+
+def _build_legend_handles(
+    split_obj: np.ndarray,
+    highlight_labels: set[str] | None,
+    id_to_obj: dict,
+) -> list[mpatches.Patch]:
+    """Build matplotlib legend patches for the BEV image."""
+    present_ids = set(int(i) for i in np.unique(split_obj))
+
+    if highlight_labels:
+        gray_seen: dict[str, np.ndarray] = {}
+        for oid in present_ids:
+            obj = id_to_obj.get(oid)
+            if obj is None:
+                continue
+            lbl = _nyu40_label(obj)
+            if lbl and lbl not in highlight_labels and lbl not in gray_seen:
+                gv = 0.30 + (abs(hash(lbl)) % 256) / 256 * 0.42
+                gray_seen[lbl] = np.array([gv, gv, gv])
+        return [
+            mpatches.Patch(color=_HIGHLIGHT, label=", ".join(sorted(highlight_labels))),
+            *[mpatches.Patch(color=c, label=lbl) for lbl, c in sorted(gray_seen.items())],
+        ]
+    else:
+        seen: dict[str, tuple[float, float, float]] = {}
+        for oid in present_ids:
+            if oid in id_to_obj:
+                lbl = _nyu40_label(id_to_obj[oid])
+                if lbl and lbl not in seen:
+                    seen[lbl] = nyu40_to_color(lbl)
+        return [
+            mpatches.Patch(color=c, label=lbl)
+            for lbl, c in sorted(seen.items())
+        ]
 
 
 # ---------------------------------------------------------------------------
@@ -369,14 +406,16 @@ def render_bev(
         z_min=z_min, z_max=z_max,
     )
 
+    # Build once; reused for highlight resolution and legend
+    id_to_obj = {obj.id: obj for obj in query.scene_graph.objects}
+
     # Resolve anchor NYU40 labels for highlight mode
     highlight_labels: set[str] | None = None
     if anchor_highlight and query.anchor_object_ids:
-        id_to_obj_full = {obj.id: obj for obj in query.scene_graph.objects}
         highlight_labels = {
-            str(id_to_obj_full[aid].metadata.get("nyu40_label", "")).lower().strip()
+            _nyu40_label(id_to_obj[aid])
             for aid in query.anchor_object_ids
-            if aid in id_to_obj_full
+            if aid in id_to_obj
         } - {""}
 
     image, meta = make_semantic_bev(
@@ -392,37 +431,8 @@ def render_bev(
     ]
     ax.imshow(image, origin="lower", interpolation="nearest", extent=extent)
 
-    # Legend
     if include_legend:
-        if highlight_labels:
-            present_ids = set(int(i) for i in np.unique(split_obj))
-            id_to_obj   = {obj.id: obj for obj in query.scene_graph.objects}
-            gray_seen: dict[str, np.ndarray] = {}
-            for oid in present_ids:
-                obj = id_to_obj.get(oid)
-                if obj is None:
-                    continue
-                lbl = str(obj.metadata.get("nyu40_label", "")).lower().strip()
-                if lbl and lbl not in highlight_labels and lbl not in gray_seen:
-                    gv = 0.30 + (abs(hash(lbl)) % 256) / 256 * 0.42
-                    gray_seen[lbl] = np.array([gv, gv, gv])
-            legend_handles = [
-                mpatches.Patch(color=_HIGHLIGHT, label=", ".join(sorted(highlight_labels))),
-                *[mpatches.Patch(color=c, label=lbl) for lbl, c in sorted(gray_seen.items())],
-            ]
-        else:
-            present_ids = set(int(i) for i in np.unique(split_obj))
-            id_to_obj   = {obj.id: obj for obj in query.scene_graph.objects}
-            seen: dict[str, tuple[float, float, float]] = {}
-            for oid in present_ids:
-                if oid in id_to_obj:
-                    lbl = str(id_to_obj[oid].metadata.get("nyu40_label", "")).lower().strip()
-                    if lbl and lbl not in seen:
-                        seen[lbl] = nyu40_to_color(lbl)
-            legend_handles = [
-                mpatches.Patch(color=c, label=lbl)
-                for lbl, c in sorted(seen.items())
-            ]
+        legend_handles = _build_legend_handles(split_obj, highlight_labels, id_to_obj)
         if legend_handles:
             ax.legend(handles=legend_handles, loc="upper right", fontsize=6,
                       framealpha=0.8, ncol=2)
@@ -432,7 +442,6 @@ def render_bev(
     # Region bounding boxes — only when there are multiple regions
     _REGION_MIN_POINTS = 50  # minimum BEV points from a region to draw its box
 
-    # Build object_id -> region_id lookup, then count BEV points per region
     obj_to_region: dict[int, int] = {
         obj.id: int(obj.metadata["region_id"])
         for obj in query.scene_graph.objects
@@ -454,19 +463,16 @@ def render_bev(
             if not all(k in m for k in bbox_keys):
                 continue
 
-            # Label filter
             if region.label.lower().strip() not in VALID_REGION_LABELS:
                 continue
 
-            # Point threshold: skip regions with too few plotted BEV points
             if region_point_counts.get(region.id, 0) < _REGION_MIN_POINTS:
                 continue
 
             rx0, rx1 = m["bbox_x_min"], m["bbox_x_max"]
             ry0, ry1 = m["bbox_y_min"], m["bbox_y_max"]
-            i = color_idx
+            color = region_colors[color_idx % len(region_colors)]
             color_idx += 1
-            color = region_colors[i % len(region_colors)]
             rect = mpatches.FancyBboxPatch(
                 (rx0, ry0), rx1 - rx0, ry1 - ry0,
                 boxstyle="square,pad=0",

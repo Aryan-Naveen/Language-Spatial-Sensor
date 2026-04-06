@@ -93,16 +93,14 @@ def build_splits(cfg: DictConfig) -> DataSplits:
              ``splits.seed``, ``splits.val_unseen_scene_frac``,
              ``splits.val_seen_stmt_frac``.
     """
-    vla3d = VLA3D(Path(cfg.data_root))
     split_cfg = cfg.splits
-
     rng = random.Random(split_cfg.seed)
 
     # --- collect all scenes across selected datasets ----------------------
     all_scenes: list[VLA3DScene] = []
     for name in cfg.datasets:
         try:
-            dataset = vla3d.get_dataset(name)
+            dataset = VLA3D(Path(cfg.data_root), name)
         except (FileNotFoundError, ValueError) as e:
             print(f"[splits] Skipping dataset '{name}': {e}")
             continue
