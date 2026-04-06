@@ -49,8 +49,7 @@ def main() -> None:
         np.random.seed(args.seed)
 
     # --- Load dataset -------------------------------------------------------
-    vla3d = VLA3D(args.data_root)
-    dataset = vla3d.get_dataset(args.dataset)
+    dataset = VLA3D(args.data_root, args.dataset)
 
     if args.scene_id:
         scene = dataset.get_scene(args.scene_id)
