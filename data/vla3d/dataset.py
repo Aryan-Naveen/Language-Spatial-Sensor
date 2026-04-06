@@ -1,10 +1,11 @@
 import json
-from collections import Counter
+from collections import Counter, defaultdict
 from pathlib import Path
 
 import numpy as np
 import open3d as o3d
 
+from language_spatial_sensor.core.ontology import VALID_NYU40_LABELS, VALID_REGION_LABELS
 from language_spatial_sensor.core.schema import (
     ObjectInfo,
     RegionInfo,
@@ -110,12 +111,13 @@ class VLA3DScene:
             return metadata.get("raw_label") or nyu40
         return nyu40 or metadata.get("raw_label") or ""
 
-    def load_statements(self) -> list[ReferentialStatement]:
+    def load_statements(self, scene_graph: SceneGraph | None = None) -> list[ReferentialStatement]:
         with open(self._file("referential_statements.json")) as f:
             data = json.load(f)
 
         # Build per-object semantic label and a scene-wide frequency count.
-        scene_graph = self.load_scene_graph()
+        if scene_graph is None:
+            scene_graph = self.load_scene_graph()
         obj_sem: dict[int, str] = {
             obj.id: self._semantic_label(obj.metadata)
             for obj in scene_graph.objects
@@ -124,7 +126,8 @@ class VLA3DScene:
 
         statements: list[ReferentialStatement] = []
 
-        for region_stmts in data["regions"].values():
+        for rid, region_stmts in data["regions"].items():
+            region_semantics = region_stmts.get("region", "")
             for text, entries in region_stmts.items():
                 if text == 'region':
                     continue
@@ -145,17 +148,73 @@ class VLA3DScene:
                             sem = obj_sem.get(aid, "")
                             others = max(sem_counts.get(sem, 1), 0)
                             ambiguity *= others
-
+                    text = "There is a " + text[4:]
                     statements.append(ReferentialStatement(
                         text=text,
                         target_object_id=target_id,
                         ambiguity=ambiguity,
                         anchor_object_id=anchor_ids,
                         relation=entry.get("relation"),
-                        region=""
+                        region=(rid, region_semantics)
                     ))
 
         return statements
+
+    # ------------------------------------------------------------------
+    # Synthetic region-grounding statements
+    # ------------------------------------------------------------------
+
+    def generate_region_statements(
+        self,
+        scene_graph: SceneGraph | None = None,
+    ) -> list[ReferentialStatement]:
+        """Generate synthetic "there is a <object> in the <region>" statements.
+
+        Only produces statements for scenes with more than one region, where
+        the region label is in VALID_REGION_LABELS and the object's nyu40_label
+        is in VALID_NYU40_LABELS.  Ambiguity is the count of objects sharing
+        the same nyu40 label within the same region.
+        """
+        if scene_graph is None:
+            scene_graph = self.load_scene_graph()
+
+        if len(scene_graph.regions) <= 1:
+            return []
+
+        valid_regions: dict[int, str] = {
+            r.id: r.label.lower().strip()
+            for r in scene_graph.regions
+            if r.label.lower().strip() in VALID_REGION_LABELS
+        }
+        if not valid_regions:
+            return []
+
+        region_objects: dict[int, list] = defaultdict(list)
+        for obj in scene_graph.objects:
+            rid = obj.metadata.get("region_id")
+            if rid is None:
+                continue
+            rid = int(rid)
+            if rid not in valid_regions:
+                continue
+            label = str(obj.label).lower().strip()
+            if label in VALID_NYU40_LABELS:
+                region_objects[rid].append((obj, label))
+
+        stmts: list[ReferentialStatement] = []
+        for rid, obj_pairs in region_objects.items():
+            region_label = valid_regions[rid]
+            label_counts = Counter(label for _, label in obj_pairs)
+            for obj, label in obj_pairs:
+                stmts.append(ReferentialStatement(
+                    text=f"there is a {label} in the {region_label}",
+                    target_object_id=obj.id,
+                    ambiguity=-1,
+                    anchor_object_id=None,
+                    relation="in region",
+                    region=(str(rid), region_label),
+                ))
+        return stmts
 
     # ------------------------------------------------------------------
     # Point cloud

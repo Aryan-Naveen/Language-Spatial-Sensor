@@ -34,6 +34,7 @@ class ReferentialStatement(BaseModel):
     # optional richer structure
     anchor_object_id: list[int] | None = None
     relation: str | None = None
+    region: tuple | None = None  # (region_id, region_label)
 
 class SceneData(BaseModel):
     scene_id: str
