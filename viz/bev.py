@@ -411,10 +411,10 @@ def render_bev(
 
     # Resolve anchor NYU40 labels for highlight mode
     highlight_labels: set[str] | None = None
-    if anchor_highlight and query.anchor_object_ids:
+    if anchor_highlight and query.gt_anchor_object_ids:
         highlight_labels = {
             _nyu40_label(id_to_obj[aid])
-            for aid in query.anchor_object_ids
+            for aid in query.gt_anchor_object_ids
             if aid in id_to_obj
         } - {""}
 
