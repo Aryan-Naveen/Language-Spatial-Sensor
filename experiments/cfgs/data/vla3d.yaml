@@ -1,0 +1,15 @@
+# Path to the root of the VLA3D data directory.
+# Override on the CLI: data.data_root=/path/to/VLA3D
+data_root: /home/aryannav/mit/data/VLA-3D/VLA-3D_dataset
+
+# Subset of datasets to include.
+# Full set: [3RScan, ARKitScenes, HM3D, Matterport, Scannet, Unity]
+datasets:
+  - HM3D
+
+splits:
+  seed: 42
+  # Fraction of scenes withheld entirely for val_unseen.
+  val_unseen_scene_frac: 0.05
+  # Fraction of statements from seen scenes reserved for val_seen.
+  val_seen_stmt_frac: 0.10

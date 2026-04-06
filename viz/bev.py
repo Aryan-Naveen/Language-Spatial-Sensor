@@ -11,6 +11,7 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 
 from language_spatial_sensor.core.schema import SpatialQuery, SceneGraph
+from language_spatial_sensor.core.ontology import VALID_NYU40_LABELS, VALID_REGION_LABELS
 
 
 # ---------------------------------------------------------------------------
@@ -170,10 +171,10 @@ def filter_object_points(
     Returns:
         (filtered_pc, filtered_split)
     """
-    # Positive allowlist: only objects whose nyu40_label appears in _PALETTE
+    # Positive allowlist: only objects whose nyu40_label is in the shared ontology
     valid_ids = np.array([
         obj.id for obj in scene_graph.objects
-        if str(obj.metadata.get("nyu40_label", "")).lower().strip() in _PALETTE
+        if str(obj.metadata.get("nyu40_label", "")).lower().strip() in VALID_NYU40_LABELS
     ], dtype=np.int64)
 
     keep = np.isin(object_split, valid_ids)
@@ -429,7 +430,6 @@ def render_bev(
     note = f"{len(pc_obj):,} object pts"
 
     # Region bounding boxes — only when there are multiple regions
-    _REGION_LABELS = {"bedroom", "office", "kitchen", "living room", "bathroom", "Hall/stairwell", "garage", "rec room"}
     _REGION_MIN_POINTS = 50  # minimum BEV points from a region to draw its box
 
     # Build object_id -> region_id lookup, then count BEV points per region
@@ -455,7 +455,7 @@ def render_bev(
                 continue
 
             # Label filter
-            if region.label.lower().strip() not in _REGION_LABELS:
+            if region.label.lower().strip() not in VALID_REGION_LABELS:
                 continue
 
             # Point threshold: skip regions with too few plotted BEV points
