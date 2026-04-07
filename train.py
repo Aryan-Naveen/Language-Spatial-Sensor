@@ -63,7 +63,7 @@ from language_spatial_sensor.pipeline.augmentations import (
     RandomSceneRotation,
 )
 from language_spatial_sensor.training.dataset import CachedLSSDataset, CollateFn
-from viz.bev import render_bev_with_samples
+from viz.bev import render_bev_with_sample_overlay
 
 
 # ── Utilities ─────────────────────────────────────────────────────────────────
@@ -195,6 +195,51 @@ def _resolve_precision(precision: str) -> torch.dtype:
     return {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[precision]
 
 
+def _load_spatial_query(
+    scene_id: str,
+    language: str,
+    data_root: Path,
+    datasets: list[str],
+):
+    """Reload raw VLA3D data for a single scene and return a SpatialQuery.
+
+    Searches each configured dataset directory for ``scene_id``, then matches
+    the statement by exact language text.  Raises if the scene or statement
+    cannot be found.
+    """
+    from data.vla3d.dataset import VLA3DScene
+
+    _CANONICAL = {
+        "3rscan": "3RScan", "arkitscenes": "ARKitScenes", "hm3d": "HM3D",
+        "matterport": "Matterport", "scannet": "Scannet", "unity": "Unity",
+    }
+
+    scene = None
+    for ds_name in datasets:
+        scene_path = data_root / _CANONICAL.get(ds_name.lower(), ds_name) / scene_id
+        if scene_path.exists():
+            scene = VLA3DScene(scene_path)
+            break
+    if scene is None:
+        raise FileNotFoundError(
+            f"Scene '{scene_id}' not found under {data_root} in datasets {datasets}"
+        )
+
+    from language_spatial_sensor.core.transforms import build_spatial_query
+
+    sg         = scene.load_scene_graph()
+    statements = scene.load_statements(sg)
+    stmt       = next((s for s in statements if s.text == language), None)
+    if stmt is None:
+        raise ValueError(f"Statement not found in scene '{scene_id}': {language!r}")
+
+    pcd          = scene.load_pointcloud()
+    points       = np.asarray(pcd.points, dtype=np.float32)
+    object_split = scene.load_object_split()
+
+    return build_spatial_query(scene_id, sg, stmt, points=points, object_split=object_split)
+
+
 @torch.no_grad()
 def generate_bev_plots(
     model: LSSModel,
@@ -205,40 +250,49 @@ def generate_bev_plots(
     n_scenes: int,
     n_samples: int,
     viz_seed: int,
+    data_root: Path,
+    datasets: list[str],
 ) -> list[tuple[str, plt.Figure]]:
-    """Run inference on N seeded scenes and return BEV figures with sample heatmaps.
+    """Run inference on N seeded val_seen scenes and return BEV + sample-density figures.
 
-    The same ``viz_seed`` always selects the same scenes, so plots are comparable
-    across epochs.  ``n_samples`` points are drawn from the predicted Gaussian and
-    passed to ``render_bev_with_samples`` as raw XYZ — swap this call for a
-    diffusion-transformer sampler and the rest of the pipeline is unchanged.
+    The same ``viz_seed`` always selects the same scenes so plots are epoch-comparable.
+    ``n_samples`` points are drawn from the predicted Gaussian and passed to
+    ``render_bev_with_sample_overlay`` as raw (K, 3) XYZ — swap this sampling call
+    for a diffusion-transformer sampler and everything downstream is unchanged.
 
     Returns:
-        List of (language_query, figure) pairs.
+        List of (language_query, figure) pairs; scenes that fail to load are skipped.
     """
-    rng = np.random.RandomState(viz_seed)
+    rng     = np.random.RandomState(viz_seed)
     indices = rng.choice(len(dataset), size=min(n_scenes, len(dataset)), replace=False)
 
     model.eval()
     figs: list[tuple[str, plt.Figure]] = []
 
     for idx in indices:
-        sample = dataset[int(idx)]
+        sample   = dataset[int(idx)]
+        scene_id = dataset.get_scene_id(int(idx))
 
-        # Collate single sample → TensorizerOutput (adds batch dim)
+        # Load raw point cloud + scene graph to build the ground-truth BEV
+        try:
+            query = _load_spatial_query(scene_id, sample.language, data_root, datasets)
+        except Exception as e:
+            print(f"[viz] Skipping scene {scene_id}: {e}")
+            continue
+
+        # Run model inference
         batch = collate_fn([sample])
         batch = _to_device(batch, device)
-
         with torch.autocast(device_type=device.type, dtype=autocast_dtype):
             pred: GaussianPrediction = _forward(model, batch)
 
-        # Sample n_samples points from the predicted Gaussian (index 0 = only item)
-        mu = pred.mu[0].float()   # (3,)
-        L  = pred.L[0].float()    # (3, 3) lower-triangular
+        # Sample n_samples points from the Gaussian (batch item 0)
+        mu   = pred.mu[0].float()   # (3,)
+        L    = pred.L[0].float()    # (3, 3) lower-triangular
         dist = torch.distributions.MultivariateNormal(mu, scale_tril=L)
         samples_xyz = dist.sample((n_samples,)).cpu().numpy()  # (n_samples, 3)
 
-        fig = render_bev_with_samples(sample, samples_xyz=samples_xyz, title=sample.language)
+        fig = render_bev_with_sample_overlay(query, samples_xyz=samples_xyz, resolution=0.25)
         figs.append((sample.language, fig))
 
     model.train()
@@ -447,27 +501,23 @@ def run_training(cfg: DictConfig) -> float:
                     })
                 wandb.log(log_dict)
 
-            # ── BEV visualisation ───────────────────────────────────────────
+            # ── BEV visualisation (val_seen only) ───────────────────────────
             if epoch % cfg.viz.plot_every == 0:
-                for split_name, ds in [
-                    ("val_seen",   val_seen_ds),
-                    ("val_unseen", val_unseen_ds),
-                ]:
-                    if ds is None:
-                        continue
-                    figs = generate_bev_plots(
-                        model, ds, collate_fn, device, autocast_dtype,
-                        n_scenes=cfg.viz.n_scenes,
-                        n_samples=cfg.viz.n_samples,
-                        viz_seed=cfg.viz.seed,
-                    )
-                    if use_wandb:
-                        wandb.log({
-                            f"viz/{split_name}/scene_{i}": wandb.Image(fig)
-                            for i, (_, fig) in enumerate(figs)
-                        })
-                    for _, fig in figs:
-                        plt.close(fig)
+                figs = generate_bev_plots(
+                    model, val_seen_ds, collate_fn, device, autocast_dtype,
+                    n_scenes=cfg.viz.n_scenes,
+                    n_samples=cfg.viz.n_samples,
+                    viz_seed=cfg.viz.seed,
+                    data_root=Path(cfg.data.data_root),
+                    datasets=list(cfg.data.datasets),
+                )
+                if use_wandb:
+                    wandb.log({
+                        f"viz/val_seen/scene_{i}": wandb.Image(fig)
+                        for i, (_, fig) in enumerate(figs)
+                    })
+                for _, fig in figs:
+                    plt.close(fig)
 
             # Save best
             if val_loss < best_val_loss:

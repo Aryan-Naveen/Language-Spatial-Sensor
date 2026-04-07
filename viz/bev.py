@@ -5,8 +5,8 @@ Pipeline (semantic mode, default when query.object_split is available):
     2. make_semantic_bev     — project to XY, bin into an RGB occupancy image
     3. render_bev            — produce a matplotlib Figure
 
-For training-loop visualization (no raw point cloud):
-    render_bev_with_samples  — draws obj bboxes from CachedSample + sample heatmap
+For training-loop visualization:
+    render_bev_with_sample_overlay  — renders anchor-highlight BEV, then hexbins samples on top
 """
 
 from __future__ import annotations
@@ -511,134 +511,94 @@ def render_bev(
 
 
 # ---------------------------------------------------------------------------
-# Training-loop BEV: CachedSample + position samples → heatmap overlay
+# Training-loop BEV: SpatialQuery + position samples → heatmap overlay
 # ---------------------------------------------------------------------------
 
-def render_bev_with_samples(
-    sample,                         # CachedSample (no batch dim)
-    samples_xyz: np.ndarray,        # (K, 3) position samples in world frame
-    title: str = "",
-    figsize: tuple[int, int] = (8, 8),
-    hexbin_gridsize: int = 50,
-    heatmap_alpha: float = 0.60,
+def render_bev_with_sample_overlay(
+    query: SpatialQuery,
+    samples_xyz: np.ndarray,  # (K, 3) position samples in world frame
+    resolution: float = 1, # voxel size in metres for the density overlay
+    heatmap_alpha: float = 0.35,
 ) -> plt.Figure:
-    """BEV figure built from a CachedSample with a sample-density heatmap overlay.
+    """Render the anchor-highlight BEV, then overlay a per-voxel sample-proportion grid.
 
-    Object boxes from ``sample.obj_bboxes`` (region frame) are back-projected to
-    world frame and drawn as rectangles in the XY plane.  The heatmap is a 2-D
-    hexbin density of the XY projection of ``samples_xyz``.
+    The underlying occupancy grid is produced by ``render_bev(anchor_highlight=True)``
+    — identical to ``scripts/test_viz --anchor_highlight``.
 
-    The interface intentionally takes raw position **samples** (not a distribution
-    object) so it generalises to diffusion-transformer output without changes.
+    Each BEV voxel is coloured by the proportion of ``samples_xyz`` that fall in it
+    (count / total_samples).  The colormap is always anchored to [0, 1] so the same
+    proportion value maps to the same colour across every epoch and every scene.
+    Voxels with zero samples are fully transparent, leaving the occupancy grid visible.
+
+    The interface accepts raw position **samples** rather than a distribution object
+    so it generalises to diffusion-transformer output without code changes.
 
     Args:
-        sample:          CachedSample (single item, no batch dim).
-        samples_xyz:     (K, 3) array of position samples in world frame.
-        title:           Figure title — shown as a quoted string above the axes.
-        hexbin_gridsize: Number of hexagons across each axis (resolution knob).
-        heatmap_alpha:   Opacity of the hexbin heatmap layer.
+        query:          SpatialQuery with point cloud and anchor metadata loaded.
+        samples_xyz:    (K, 3) array of position samples in world frame.
+        resolution:     Voxel side length in metres — match to BEV resolution.
+        heatmap_alpha:  Opacity of occupied voxels (0 = invisible, 1 = opaque).
 
     Returns:
         ``matplotlib.figure.Figure``
     """
-    coord_scale = sample.coord_scale.numpy()    # (3,)
-    coord_shift = sample.coord_shift.numpy()    # (3,)
-    obj_bboxes  = sample.obj_bboxes.numpy()     # (N, 6) [cx,cy,cz,w,h,l] region frame
-    is_anchor   = sample.obj_is_anchor.numpy()  # (N,) bool
-    is_padded   = sample.obj_padding_mask.numpy()  # (N,) True = padded slot
-    target_xyz  = sample.target_xyz_world.numpy()  # (3,)
+    fig = render_bev(query, anchor_highlight=True, include_legend=False)
+    ax = fig.axes[0]
 
-    # Back-project box centres and sizes to world frame (XY only for BEV)
-    cx_w = obj_bboxes[:, 0] * coord_scale[0] + coord_shift[0]
-    cy_w = obj_bboxes[:, 1] * coord_scale[1] + coord_shift[1]
-    w_w  = np.abs(obj_bboxes[:, 3] * coord_scale[0])
-    h_w  = np.abs(obj_bboxes[:, 4] * coord_scale[1])
+    x_min, x_max = ax.get_xlim()
+    y_min, y_max = ax.get_ylim()
 
-    # Extent: union of object centres and samples with a margin
-    active = ~is_padded
-    margin = 0.5
-    all_x = np.concatenate([cx_w[active], samples_xyz[:, 0], [target_xyz[0]]])
-    all_y = np.concatenate([cy_w[active], samples_xyz[:, 1], [target_xyz[1]]])
-    x_min, x_max = all_x.min() - margin, all_x.max() + margin
-    y_min, y_max = all_y.min() - margin, all_y.max() + margin
+    W = max(int(np.ceil((x_max - x_min) / resolution)), 1)
+    H = max(int(np.ceil((y_max - y_min) / resolution)), 1)
 
-    fig, ax = plt.subplots(figsize=figsize)
-    ax.set_facecolor("#111111")
-    fig.patch.set_facecolor("#111111")
-    ax.set_aspect("equal")
-
-    # ── Object bboxes ──────────────────────────────────────────────────────────
-    for i in range(len(obj_bboxes)):
-        if is_padded[i]:
-            continue
-        x0 = cx_w[i] - w_w[i] / 2.0
-        y0 = cy_w[i] - h_w[i] / 2.0
-        color = "#FF6B6B" if is_anchor[i] else "#888888"
-        zorder = 3 if is_anchor[i] else 2
-        rect = mpatches.FancyBboxPatch(
-            (x0, y0), max(w_w[i], 0.05), max(h_w[i], 0.05),
-            boxstyle="square,pad=0",
-            linewidth=0.8,
-            edgecolor=color,
-            facecolor=color,
-            alpha=0.30,
-            zorder=zorder,
-        )
-        ax.add_patch(rect)
-
-    # ── Sample density heatmap ─────────────────────────────────────────────────
-    sx, sy = samples_xyz[:, 0], samples_xyz[:, 1]
-    hb = ax.hexbin(
-        sx, sy,
-        gridsize=hexbin_gridsize,
-        cmap="hot",
-        alpha=heatmap_alpha,
-        mincnt=1,
-        extent=(x_min, x_max, y_min, y_max),
-        zorder=4,
+    counts, _, _ = np.histogram2d(
+        samples_xyz[:, 0], samples_xyz[:, 1],
+        bins=[W, H],
+        range=[[x_min, x_max], [y_min, y_max]],
     )
-    cb = fig.colorbar(hb, ax=ax, fraction=0.03, pad=0.02)
-    cb.set_label("sample density", color="white", fontsize=7)
-    cb.ax.yaxis.set_tick_params(color="white")
-    plt.setp(cb.ax.yaxis.get_ticklabels(), color="white")
+    proportion = (counts / len(samples_xyz)).T  # (H, W), values in [0, 1]
 
-    # ── Ground-truth target (gold star) ───────────────────────────────────────
-    ax.plot(
-        target_xyz[0], target_xyz[1],
-        marker="*", color="#FFD700", markersize=16,
-        markeredgecolor="black", markeredgewidth=0.8,
-        zorder=6,
-    )
+    # Log-scale for more signal at low densities.
+    # log(proportion + eps) ∈ [log(eps), 0]; remap that fixed interval to [0, 1]
+    # so 0 proportion always → cool end and 1 proportion always → warm end.
+    _EPS = 1e-8
+    _LOG_MIN = np.log(_EPS)   # fixed lower bound ≈ -18.4
+    _LOG_MAX = np.log(0.2)    # fixed upper bound ≈ -1.6; proportions ≥ 0.2 saturate to warm end
+    log_prop = np.log(proportion + _EPS)
+    normalized = np.clip((log_prop - _LOG_MIN) / (_LOG_MAX - _LOG_MIN), 0.0, 1.0)
 
-    ax.set_xlim(x_min, x_max)
-    ax.set_ylim(y_min, y_max)
-    ax.set_xlabel("x (m)", color="white")
-    ax.set_ylabel("y (m)", color="white")
-    ax.tick_params(colors="white")
-    for spine in ax.spines.values():
-        spine.set_edgecolor("#444444")
+    rgba = plt.cm.plasma(normalized)             # (H, W, 4)
+    rgba[..., 3] = heatmap_alpha                 # uniform alpha — colour everywhere
 
-    if title:
-        short = title if len(title) <= 80 else title[:77] + "..."
-        ax.set_title(f'"{short}"', fontsize=8, color="white")
+    # ── Mask voxels outside all region bounding boxes ─────────────────────────
+    # Use every region bbox in the scene graph (including regions excluded from
+    # the BEV render due to invalid semantics) as the authoritative scene extent.
+    # Voxels whose centres fall outside every bbox are set to alpha=0 (white).
+    region_boxes = []
+    for region in query.scene_graph.regions:
+        m = region.metadata
+        if all(k in m for k in ("bbox_x_min", "bbox_x_max", "bbox_y_min", "bbox_y_max")):
+            region_boxes.append((
+                float(m["bbox_x_min"]), float(m["bbox_x_max"]),
+                float(m["bbox_y_min"]), float(m["bbox_y_max"]),
+            ))
 
-    legend_handles = [
-        mpatches.Patch(color="#FF6B6B", alpha=0.6, label="anchor obj"),
-        mpatches.Patch(color="#888888", alpha=0.6, label="other obj"),
-        plt.Line2D(
-            [0], [0], marker="*", color="w",
-            markerfacecolor="#FFD700", markersize=10,
-            label="GT target", linestyle="none",
-        ),
-    ]
-    ax.legend(
-        handles=legend_handles,
-        loc="upper right",
-        fontsize=7,
-        framealpha=0.5,
-        labelcolor="white",
-        facecolor="#222222",
-        edgecolor="#555555",
+    vox_cx = x_min + (np.arange(W) + 0.5) * resolution  # (W,)
+    vox_cy = y_min + (np.arange(H) + 0.5) * resolution  # (H,)
+    cx_grid, cy_grid = np.meshgrid(vox_cx, vox_cy)       # (H, W) each
+
+    inside = np.zeros((H, W), dtype=bool)
+    for rx0, rx1, ry0, ry1 in region_boxes:
+        inside |= (cx_grid >= rx0) & (cx_grid <= rx1) & (cy_grid >= ry0) & (cy_grid <= ry1)
+
+    rgba[~inside, 3] = 0.0
+
+    ax.imshow(
+        rgba,
+        origin="lower",
+        extent=[x_min, x_max, y_min, y_max],
+        interpolation="nearest",
+        zorder=4,  # above BEV image, below gold star (zorder=5)
     )
 
     fig.tight_layout()

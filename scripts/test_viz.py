@@ -19,7 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from data.vla3d.dataset import VLA3D
 from language_spatial_sensor.core.transforms import build_spatial_query
-from viz.bev import render_bev
+from viz.bev import render_bev, render_bev_with_sample_overlay
 
 
 def parse_args() -> argparse.Namespace:
@@ -32,12 +32,16 @@ def parse_args() -> argparse.Namespace:
                    help="Specific scene ID to load; random if omitted.")
     p.add_argument("--save", default=None, type=Path,
                    help="If given, save figure to this path instead of displaying.")
-    p.add_argument("--resolution", default=0.05, type=float,
+    p.add_argument("--resolution", default=0.25, type=float,
                    help="BEV grid cell size in metres (default: 0.05).")
     p.add_argument("--seed", default=None, type=int,
                    help="Random seed for reproducible sampling.")
     p.add_argument("--anchor_highlight", action="store_true",
                    help="Grayscale all objects except those sharing a class with the anchor.")
+    p.add_argument("--sample_overlay", action="store_true",
+                   help="Overlay a random Gaussian sample heatmap (tests render_bev_with_sample_overlay).")
+    p.add_argument("--n_samples", default=5000, type=int,
+                   help="Number of random samples for --sample_overlay (default: 5000).")
     return p.parse_args()
 
 
@@ -97,7 +101,18 @@ def main() -> None:
     print(f"PC after target removal: {query.pc.shape[0]:,} points")
 
     # --- BEV render ---------------------------------------------------------
-    fig = render_bev(query, resolution=args.resolution, anchor_highlight=args.anchor_highlight)
+    if args.sample_overlay:
+        # Random Gaussian centred near the target — stand-in for model output
+        rng = np.random.RandomState(args.seed if args.seed is not None else 0)
+        mu  = query.target_xyz.astype(np.float64)
+        std = np.array(query.pc[:, :2].std(axis=0).mean()) * 0.3  # ~30 % of scene spread
+        samples_xy  = rng.randn(args.n_samples, 2) * std + mu[:2]
+        samples_z   = rng.randn(args.n_samples, 1) * 0.3 + mu[2]
+        samples_xyz = np.concatenate([samples_xy, samples_z], axis=1).astype(np.float32)
+        fig = render_bev_with_sample_overlay(query, samples_xyz=samples_xyz,
+                                              resolution=args.resolution)
+    else:
+        fig = render_bev(query, resolution=args.resolution, anchor_highlight=args.anchor_highlight)
 
     if args.save:
         fig.savefig(args.save, dpi=150, bbox_inches="tight")

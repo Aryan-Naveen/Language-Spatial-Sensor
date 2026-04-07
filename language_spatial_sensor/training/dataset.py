@@ -24,6 +24,7 @@ Usage::
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import fields, replace
 from pathlib import Path
 
@@ -32,6 +33,9 @@ from torch.utils.data import Dataset
 from transformers import AutoTokenizer
 
 from language_spatial_sensor.core.schema import CachedSample, TensorizerOutput
+
+# Matches filenames written by preprocess.py: {scene_id}_{global_idx:07d}.pt
+_FNAME_RE = re.compile(r'^(.+)_\d{7}\.pt$')
 
 
 def _coerce_target_bbox_aabb6(sample: CachedSample) -> CachedSample:
@@ -83,6 +87,14 @@ class CachedLSSDataset(Dataset):
 
     def __len__(self) -> int:
         return len(self._files)
+
+    def get_scene_id(self, idx: int) -> str:
+        """Return the scene_id embedded in the cached filename at position ``idx``."""
+        fname = self._files[idx]
+        m = _FNAME_RE.match(fname)
+        if m is None:
+            raise ValueError(f"Cannot parse scene_id from cached filename: {fname!r}")
+        return m.group(1)
 
     def __getitem__(self, idx: int) -> CachedSample:
         path = self.cache_dir / self._files[idx]
