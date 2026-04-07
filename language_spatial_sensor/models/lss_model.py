@@ -12,10 +12,10 @@ Forward pass shape trace (B=batch, N=max_objects, L=text_len, D=hidden_dim):
     obj_clip_features     (B, N, D_clip) → VisionEncoder
     obj_is_anchor         (B, N)         ↗
 
-    obj_bboxes            (B, N, 6)  → SpatialRelationMLP → (B, N, N, 12)
+    obj_bboxes            (B, N, 6)  → SpatialRelationMLP → (B, N, N, R)
       (bboxes are in region-normalized frame; coord_scale/coord_shift carry the transform)
 
-    [obj features (B,N,D)] + [spatial (B,N,N,12)] → BACKBONE → (B,N,D)
+    [obj features (B,N,D)] + [spatial (B,N,N,R)] → BACKBONE → (B,N,D)
 
     prepend text CLS      → sequence (B, 1+N, D)
     add modality tags
@@ -137,19 +137,19 @@ class LSSModel(nn.Module):
         B, N, _ = obj_clip_features.shape
 
         # ── 1. Encode text (CLS token) ─────────────────────────────────────────
-        text_feat = self.text_enc(text_input_ids, text_attention_mask)  # (B, D)
+        text_cls = self.text_enc(text_input_ids, text_attention_mask)  # (B, D)
 
         # ── 2. Encode vision + add role / modality tags ────────────────────────
-        obj_feat = self.vision_enc(obj_clip_features, obj_is_anchor)    # (B, N, D)
+        obj_feat_vis = self.vision_enc(obj_clip_features, obj_is_anchor)  # (B, N, D)
 
         # ── 3. Compute pairwise spatial relations ──────────────────────────────
-        spatial_rel = self.spatial_enc(obj_bboxes)                      # (B, N, N, 12)
+        spatial_rel = self.spatial_enc(obj_bboxes)                      # (B, N, N, R)
 
         # ── 4. Spatial refinement backbone (e.g. ViSTA) ───────────────────────
-        obj_feat = self.backbone(obj_feat, spatial_rel, obj_padding_mask)  # (B, N, D)
+        obj_feat = self.backbone(obj_feat_vis, spatial_rel, obj_padding_mask)  # (B, N, D)
 
         # ── 5. Prepend text CLS and add modality tag ───────────────────────────
-        text_feat = text_feat.unsqueeze(1)                              # (B, 1, D)
+        text_feat = text_cls.unsqueeze(1)                              # (B, 1, D)
         text_feat = text_feat + self.modality_embed.weight[self._MODALITY_TEXT]
 
         seq = torch.cat([text_feat, obj_feat], dim=1)                  # (B, 1+N, D)
@@ -162,11 +162,13 @@ class LSSModel(nn.Module):
         seq = self.fusion(seq, fusion_mask)                             # (B, 1+N, D)
 
         # ── 7. Pool → scene-text context vector ───────────────────────────────
-        ctx = self.pool(seq, fusion_mask)                               # (B, D)
+        ctx_pool = self.pool(seq, fusion_mask)                          # (B, D)
 
         # ── 7b. FiLM conditioning (region scale/shift → γ*ctx + β) ────────────
         if self.film is not None:
-            ctx = self.film(ctx, coord_scale, coord_shift)              # (B, D)
+            ctx = self.film(ctx_pool, coord_scale, coord_shift)         # (B, D)
+        else:
+            ctx = ctx_pool
 
         # ── 8. Predict 3-D Gaussian (region frame → world frame) ──────────────
         return self.head(ctx, coord_scale, coord_shift)

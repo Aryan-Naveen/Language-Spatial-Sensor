@@ -1,3 +1,25 @@
+# ── Project-specific ──────────────────────────────────────────────────────────
+
+# Preprocessed dataset cache (built by scripts/preprocess.py — can be large)
+cache/
+
+# Model checkpoints and raw tensor files
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+
+# Hydra run outputs (timestamped directories under outputs/ and multirun/)
+outputs/
+multirun/
+
+# Weights & Biases local run artifacts
+wandb/
+
+# Raw dataset (not committed — too large; set data.data_root in config instead)
+data/
+
+# ── Python standard ───────────────────────────────────────────────────────────
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

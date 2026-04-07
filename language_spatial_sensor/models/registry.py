@@ -1,10 +1,10 @@
-from typing import Any, Callable, Dict, Type, TypeVar
+from typing import Any, Callable, Dict, TypeVar, Union
 
 T = TypeVar("T")
 
 
 class Registry:
-    """Decorator-based registry mapping string keys to classes.
+    """Decorator-based registry mapping string keys to classes or callables.
 
     Usage::
 
@@ -14,21 +14,27 @@ class Registry:
         class Foo(nn.Module): ...
 
         obj = MY_REGISTRY.build("foo", cfg)
+
+        # Also works for plain functions (e.g. loss functions):
+        @MY_REGISTRY.register("bar_loss")
+        def bar_loss(pred, target, **kwargs): ...
+
+        result = MY_REGISTRY.build("bar_loss", pred, target)
     """
 
     def __init__(self, name: str) -> None:
         self._name = name
-        self._registry: Dict[str, Type] = {}
+        self._registry: Dict[str, Union[type, Callable]] = {}
 
-    def register(self, name: str) -> Callable[[Type[T]], Type[T]]:
-        def decorator(cls: Type[T]) -> Type[T]:
+    def register(self, name: str) -> Callable[[T], T]:
+        def decorator(fn: T) -> T:
             if name in self._registry:
                 raise KeyError(
                     f"{self._name} registry already contains '{name}'. "
                     f"Existing keys: {list(self._registry)}"
                 )
-            self._registry[name] = cls
-            return cls
+            self._registry[name] = fn  # type: ignore[assignment]
+            return fn
 
         return decorator
 
@@ -54,3 +60,4 @@ class Registry:
 BACKBONE_REGISTRY = Registry("backbone")   # spatial refinement backbone (VisTA, DiT, …)
 POOLING_REGISTRY  = Registry("pooling")    # sequence → fixed-dim vector
 HEAD_REGISTRY     = Registry("head")       # distribution regression head
+LOSS_REGISTRY     = Registry("loss")       # loss functions: (pred, batch_fields…) → scalar

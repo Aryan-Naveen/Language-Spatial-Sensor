@@ -1,6 +1,6 @@
 """3D-VisTA spatial attention backbone.
 
-MultiHeadAttentionSpatial adds a per-head learned bias from pairwise 12-D
+MultiHeadAttentionSpatial adds a per-head learned bias from pairwise
 geometric features to the standard QK attention logits.  This lets the model
 attend differently to nearby vs. far objects and understand directional
 relationships without positional encodings.
@@ -22,7 +22,7 @@ class MultiHeadAttentionSpatial(nn.Module):
     Args:
         d_model:     token feature dimension (hidden_dim)
         num_heads:   number of attention heads
-        spatial_dim: dimension of pairwise spatial features (12)
+        spatial_dim: dimension of pairwise spatial features (``cfg.spatial_relation_dim``)
         dropout:     attention dropout probability
     """
 
@@ -45,7 +45,7 @@ class MultiHeadAttentionSpatial(nn.Module):
         self.v_proj   = nn.Linear(d_model, d_model)
         self.out_proj = nn.Linear(d_model, d_model)
 
-        # Project 12-D spatial features to one scalar bias per head.
+        # Project spatial features to one scalar bias per head.
         # bias=False: spatial features are zero-mean; no constant offset needed.
         self.spatial_proj = nn.Linear(spatial_dim, num_heads, bias=False)
 
@@ -80,6 +80,9 @@ class MultiHeadAttentionSpatial(nn.Module):
             )
 
         attn_weights = F.softmax(attn_logits, dim=-1)
+        # If every key is padded for a query row, logits are all -inf → softmax NaN.
+        # Zero those weights so the head contributes nothing instead of poisoning the graph.
+        attn_weights = torch.nan_to_num(attn_weights, nan=0.0)
         attn_weights = F.dropout(attn_weights, p=self.dropout_p, training=self.training)
 
         out = torch.matmul(attn_weights, v)              # (B, H, N, d)
@@ -111,7 +114,7 @@ class SpatialEncoderLayer(nn.Module):
     def forward(
         self,
         x: torch.Tensor,                    # (B, N, D)
-        spatial_relations: torch.Tensor,    # (B, N, N, 12)
+        spatial_relations: torch.Tensor,    # (B, N, N, spatial_dim)
         key_padding_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:                      # (B, N, D)
         # pre-norm residual style
@@ -141,7 +144,7 @@ class SceneSpatialEncoder(nn.Module):
     def forward(
         self,
         obj_features: torch.Tensor,         # (B, N, D)
-        spatial_relations: torch.Tensor,    # (B, N, N, 12)
+        spatial_relations: torch.Tensor,    # (B, N, N, spatial_dim)
         key_padding_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:                      # (B, N, D)
         x = obj_features

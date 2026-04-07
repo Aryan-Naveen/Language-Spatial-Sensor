@@ -1,3 +1,4 @@
 defaults:
   - data: vla3d
+  - model: lss
   - _self_

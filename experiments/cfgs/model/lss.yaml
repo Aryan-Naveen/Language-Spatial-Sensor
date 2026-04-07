@@ -1,0 +1,48 @@
+# LSSConfig hyperparameters.
+# All fields map directly to language_spatial_sensor.models.config.LSSConfig.
+
+# ── Dimensions ────────────────────────────────────────────────────────────────
+hidden_dim: 256
+clip_dim: 512
+bert_dim: 768
+
+# ── Text encoder ──────────────────────────────────────────────────────────────
+text_model: bert-base-uncased
+freeze_text: false        # fine-tune BERT; set true to freeze for faster runs
+
+# ── Spatial relation MLP ──────────────────────────────────────────────────────
+spatial_relation_dim: 12  # mlp: 6+6 concat; center/vertical_bottom: 1, 4, or 5
+spatial_mlp_hidden: 64
+pairwise_rel_type: mlp         # mlp | center | vertical_bottom
+spatial_pairwise_dist_norm: true   # unused for mlp
+
+# ── Backbone ──────────────────────────────────────────────────────────────────
+backbone_type: scene_spatial
+num_spatial_layers: 3
+
+# ── Global fusion transformer ─────────────────────────────────────────────────
+num_fusion_layers: 3
+num_heads: 8
+ffn_dim: 1024
+
+# ── Pooling ───────────────────────────────────────────────────────────────────
+pooling_type: mean        # {mean, max, attention}
+
+# ── Output head ───────────────────────────────────────────────────────────────
+# gaussian_cholesky | gaussian_diagonal
+head_type: gaussian_diagonal
+# gaussian_diagonal only (safe defaults for cholesky head — unused)
+head_hidden_sizes: [1024, 512]
+head_dropout: 0.15
+head_min_sigma: 0.001
+
+# ── FiLM conditioning ─────────────────────────────────────────────────────────
+use_film: true
+film_hidden_dim: 64
+
+# ── Regularisation ────────────────────────────────────────────────────────────
+dropout: 0.3
+
+# ── Sequence limits ───────────────────────────────────────────────────────────
+max_objects: 150
+max_text_len: 64

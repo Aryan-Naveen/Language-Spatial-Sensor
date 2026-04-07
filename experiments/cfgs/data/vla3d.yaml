@@ -5,7 +5,7 @@ data_root: /home/aryannav/mit/data/VLA-3D/VLA-3D_dataset
 # Subset of datasets to include.
 # Full set: [3RScan, ARKitScenes, HM3D, Matterport, Scannet, Unity]
 datasets:
-  - HM3D
+  - Unity
 
 splits:
   seed: 42

@@ -1,7 +1,7 @@
 from .config import LSSConfig
-from .heads import GaussianPrediction
+from .components.heads import GaussianPrediction
 from .lss_model import LSSModel
-from .registry import BACKBONE_REGISTRY, HEAD_REGISTRY, POOLING_REGISTRY
+from .registry import BACKBONE_REGISTRY, HEAD_REGISTRY, LOSS_REGISTRY, POOLING_REGISTRY
 
 __all__ = [
     "LSSConfig",
@@ -10,4 +10,5 @@ __all__ = [
     "BACKBONE_REGISTRY",
     "POOLING_REGISTRY",
     "HEAD_REGISTRY",
+    "LOSS_REGISTRY",
 ]

@@ -5,23 +5,24 @@ Typical usage::
     from language_spatial_sensor.core.ontology import VALID_NYU40_LABELS
     from language_spatial_sensor.pipeline.tensorizer import Tensorizer, build_clip_label_map
 
-    # Once at startup — encodes all object labels with frozen CLIP text encoder
-    label_map = build_clip_label_map(all_obj_labels)
+    # Once at startup — encodes all object labels with frozen CLIP (openai/clip)
+    label_map = build_clip_label_map(all_obj_labels)  # uses clip.load("ViT-B/32")
     tensorizer = Tensorizer(clip_embedding_map=label_map)
 
-    output = tensorizer.tensorize(query)   # TensorizerOutput (no batch dim)
+    output = tensorizer.tensorize(query)   # CachedSample (no batch dim)
 """
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 import numpy as np
 import torch
-from transformers import AutoTokenizer
 
 from language_spatial_sensor.core.schema import (
+    CachedSample,
     RegionInfo,
     SpatialQuery,
-    TensorizerOutput,
 )
 
 
@@ -29,25 +30,29 @@ from language_spatial_sensor.core.schema import (
 
 def build_clip_label_map(
     labels: list[str],
-    clip_model_name: str = "openai/clip-vit-base-patch32",
+    clip_model_name: str = "ViT-B/32",
     device: str = "cpu",
 ) -> dict[str, np.ndarray]:
     """Encode a list of label strings with a frozen CLIP text encoder.
 
+    Uses the openai/clip package (import clip).
     Returns a dict mapping each label to a (512,) float32 numpy array.
     Call once before training; pass the result to Tensorizer.
     """
-    from transformers import CLIPTextModel, CLIPTokenizer
+    import clip
 
-    tokenizer = CLIPTokenizer.from_pretrained(clip_model_name)
-    model = CLIPTextModel.from_pretrained(clip_model_name).to(device).eval()
+    model, _ = clip.load(clip_model_name, device=device)
+    model.eval()
 
     result: dict[str, np.ndarray] = {}
     with torch.no_grad():
-        for label in labels:
-            inputs = tokenizer(label, return_tensors="pt", padding=True).to(device)
-            feat = model(**inputs).pooler_output.squeeze(0).cpu().numpy()
-            result[label] = feat.astype(np.float32)
+        # clip.tokenize handles truncation to 77 tokens
+        tokens = clip.tokenize(labels).to(device)           # (N, 77)
+        feats  = model.encode_text(tokens)                  # (N, 512)
+        feats  = feats / feats.norm(dim=-1, keepdim=True)   # L2-normalise
+
+    for label, feat in zip(labels, feats):
+        result[label] = feat.cpu().float().numpy()
 
     return result
 
@@ -55,11 +60,12 @@ def build_clip_label_map(
 # ── Tensorizer ────────────────────────────────────────────────────────────────
 
 class Tensorizer:
-    """Converts a SpatialQuery into model-ready TensorizerOutput tensors.
+    """Converts a SpatialQuery into a CachedSample for on-disk storage.
+
+    Text tokenization is intentionally excluded here; it runs at batch time
+    inside CollateFn so the tokenizer lives only in the training process.
 
     Args:
-        tokenizer_name:     HuggingFace tokenizer for text (should match TextEncoder).
-        max_text_len:       Padding/truncation length for BERT tokens.
         max_objects:        Max objects per scene; shorter scenes are zero-padded.
         clip_embedding_map: Dict mapping obj.label → (clip_dim,) float32 array.
                             Built once at startup via build_clip_label_map().
@@ -69,52 +75,78 @@ class Tensorizer:
 
     def __init__(
         self,
-        tokenizer_name: str = "bert-base-uncased",
-        max_text_len: int = 64,
         max_objects: int = 100,
         clip_embedding_map: dict[str, np.ndarray] | None = None,
         clip_dim: int = 512,
     ) -> None:
-        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
-        self.max_text_len = max_text_len
         self.max_objects = max_objects
         self.clip_embedding_map: dict[str, np.ndarray] = clip_embedding_map or {}
         self.clip_dim = clip_dim
 
-    # ── Public entry point ────────────────────────────────────────────────────
+    # ── Public entry points ───────────────────────────────────────────────────
 
-    def tensorize(self, query: SpatialQuery) -> TensorizerOutput:
-        """Convert a single SpatialQuery into model-ready tensors."""
-        # A. Resolve region bounding box
-        region_id, region_bbox = self._resolve_region(query)
+    def tensorize(self, query: SpatialQuery) -> CachedSample:
+        """Convert a single SpatialQuery into a CachedSample for on-disk storage."""
+        return self.tensorize_batch([query])[0]
 
-        # B. Coordinate frame: shift = region center, scale = per-axis size
-        coord_shift, coord_scale = self._compute_coord_frame(region_bbox)
+    def tensorize_batch(self, queries: Sequence[SpatialQuery]) -> list[CachedSample]:
+        """Convert many SpatialQueries with batched NumPy work and few torch conversions."""
+        if not queries:
+            return []
 
-        # C. Object crop + normalization
-        clip_feats, bboxes, is_anchor, padding_mask = self._tensorize_objects(
-            query, region_id, coord_shift, coord_scale
-        )
+        B = len(queries)
+        region_bboxes = np.zeros((B, 6), dtype=np.float32)
+        region_ids: list[int | None] = []
+        for i, q in enumerate(queries):
+            rid, bbox = self._resolve_region(q)
+            region_ids.append(rid)
+            region_bboxes[i] = bbox
 
-        # D. Text tokenization
-        input_ids, attention_mask = self._tokenize(query.language)
+        coord_shift_b, coord_scale_b = self._compute_coord_frame_batched(region_bboxes)
 
-        # E. Target supervision — kept in world frame for loss
-        target_xyz_world = torch.from_numpy(query.target_xyz.astype(np.float32))
-        target_bbox_world = self._resolve_target_bbox(query)
+        clip_feats = np.zeros((B, self.max_objects, self.clip_dim), dtype=np.float32)
+        bboxes = np.zeros((B, self.max_objects, 6), dtype=np.float32)
+        is_anchor = np.zeros((B, self.max_objects), dtype=bool)
+        padding_mask = np.ones((B, self.max_objects), dtype=bool)
 
-        return TensorizerOutput(
-            text_input_ids=input_ids,
-            text_attention_mask=attention_mask,
-            obj_clip_features=torch.from_numpy(clip_feats),
-            obj_bboxes=torch.from_numpy(bboxes),
-            obj_is_anchor=torch.from_numpy(is_anchor),
-            obj_padding_mask=torch.from_numpy(padding_mask),
-            coord_shift=torch.from_numpy(coord_shift),
-            coord_scale=torch.from_numpy(coord_scale),
-            target_xyz_world=target_xyz_world,
-            target_bbox_world=target_bbox_world,
-        )
+        for i, q in enumerate(queries):
+            self._tensorize_objects_into(
+                q,
+                region_ids[i],
+                coord_shift_b[i],
+                coord_scale_b[i],
+                clip_feats[i],
+                bboxes[i],
+                is_anchor[i],
+                padding_mask[i],
+            )
+
+        target_xyz = np.stack([q.target_xyz.astype(np.float32) for q in queries], axis=0)
+        target_bbox_world = self._stack_target_bbox_world_numpy(queries)
+
+        t_clip = torch.from_numpy(clip_feats)
+        t_obj_bbox = torch.from_numpy(bboxes)
+        t_is_anchor = torch.from_numpy(is_anchor)
+        t_pad = torch.from_numpy(padding_mask)
+        t_shift = torch.from_numpy(coord_shift_b)
+        t_scale = torch.from_numpy(coord_scale_b)
+        t_tgt_xyz = torch.from_numpy(target_xyz)
+        t_tgt_bbox = torch.from_numpy(target_bbox_world)
+
+        return [
+            CachedSample(
+                language=queries[i].language,
+                obj_clip_features=t_clip[i],
+                obj_bboxes=t_obj_bbox[i],
+                obj_is_anchor=t_is_anchor[i],
+                obj_padding_mask=t_pad[i],
+                coord_shift=t_shift[i],
+                coord_scale=t_scale[i],
+                target_xyz_world=t_tgt_xyz[i],
+                target_bbox_world=t_tgt_bbox[i],
+            )
+            for i in range(B)
+        ]
 
     # ── Internal steps ────────────────────────────────────────────────────────
 
@@ -131,10 +163,7 @@ class Tensorizer:
                     if bbox is not None:
                         return region_id, bbox
 
-        # Fallback: derive bbox from point cloud extent (5th/95th percentile)
-        lo = np.percentile(query.pc, 5, axis=0).astype(np.float32)
-        hi = np.percentile(query.pc, 95, axis=0).astype(np.float32)
-        return None, np.concatenate([lo, hi])
+        raise ValueError(f"Region ID {region_id} not found in scene graph for scene '{query.scene_id}'")
 
     @staticmethod
     def _region_bbox(region: RegionInfo) -> np.ndarray | None:
@@ -159,21 +188,29 @@ class Tensorizer:
         coord_scale = np.maximum(bbox_max - bbox_min, 1e-3).astype(np.float32)
         return coord_shift, coord_scale
 
-    def _tensorize_objects(
+    @staticmethod
+    def _compute_coord_frame_batched(
+        region_bboxes: np.ndarray,  # (B, 6)
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Vectorized coord frame; same math as `_compute_coord_frame` per row."""
+        bbox_min = region_bboxes[:, :3]
+        bbox_max = region_bboxes[:, 3:]
+        coord_shift = ((bbox_min + bbox_max) / 2.0).astype(np.float32)
+        coord_scale = np.maximum(bbox_max - bbox_min, 1e-3).astype(np.float32)
+        return coord_shift, coord_scale
+
+    def _tensorize_objects_into(
         self,
         query: SpatialQuery,
         region_id: int | None,
         coord_shift: np.ndarray,   # (3,)
         coord_scale: np.ndarray,   # (3,)
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        """Crop objects to region, normalize to region frame, pad to max_objects.
-
-        Returns:
-            clip_feats    (max_objects, clip_dim)  float32
-            bboxes        (max_objects, 6)         float32  [cx,cy,cz,w,h,l] region frame
-            is_anchor     (max_objects,)           bool
-            padding_mask  (max_objects,)           bool  True = padded slot
-        """
+        out_clip: np.ndarray,       # (max_objects, clip_dim)
+        out_bboxes: np.ndarray,     # (max_objects, 6)
+        out_is_anchor: np.ndarray,  # (max_objects,)
+        out_padding_mask: np.ndarray,  # (max_objects,)
+    ) -> None:
+        """Crop objects to region, normalize to region frame, pad to max_objects (in-place)."""
         anchor_ids: set[int] = set(query.gt_anchor_object_ids or [])
 
         objs = [
@@ -181,22 +218,15 @@ class Tensorizer:
             if region_id is None or obj.metadata.get("region_id") == region_id
         ]
 
-        # Truncate if more objects than max_objects
         objs = objs[: self.max_objects]
-        n = len(objs)
 
-        clip_feats   = np.zeros((self.max_objects, self.clip_dim), dtype=np.float32)
-        bboxes       = np.zeros((self.max_objects, 6),             dtype=np.float32)
-        is_anchor    = np.zeros((self.max_objects,),               dtype=bool)
-        padding_mask = np.ones((self.max_objects,),                dtype=bool)   # True=padded
+        out_padding_mask[:] = True
 
         for i, obj in enumerate(objs):
-            # CLIP features via label lookup
-            clip_feats[i] = self.clip_embedding_map.get(
+            out_clip[i] = self.clip_embedding_map.get(
                 obj.label, np.zeros(self.clip_dim, dtype=np.float32)
             )
 
-            # Bbox: 8-corner format (24 floats) → [cx,cy,cz,w,h,l] in region frame
             if obj.bbox is not None:
                 corners = np.array(obj.bbox, dtype=np.float32).reshape(8, 3)
                 center_world = corners.mean(axis=0)
@@ -207,30 +237,38 @@ class Tensorizer:
 
             center_region = (center_world - coord_shift) / coord_scale
             size_region   = size_world / coord_scale
-            bboxes[i]     = np.concatenate([center_region, size_region])
+            out_bboxes[i] = np.concatenate([center_region, size_region])
 
-            is_anchor[i]    = obj.id in anchor_ids
-            padding_mask[i] = False   # real object slot
-
-        return clip_feats, bboxes, is_anchor, padding_mask
-
-    def _tokenize(self, text: str) -> tuple[torch.Tensor, torch.Tensor]:
-        """Tokenize text to (input_ids, attention_mask), both shape (max_text_len,)."""
-        enc = self.tokenizer(
-            text,
-            max_length=self.max_text_len,
-            padding="max_length",
-            truncation=True,
-            return_tensors="pt",
-        )
-        return enc["input_ids"].squeeze(0), enc["attention_mask"].squeeze(0)
+            out_is_anchor[i] = obj.id in anchor_ids
+            out_padding_mask[i] = False
 
     @staticmethod
-    def _resolve_target_bbox(query: SpatialQuery) -> torch.Tensor:
-        """Return target bbox (6,) in world frame; fall back to small cube if None."""
-        if query.target_bbox is not None:
-            return torch.from_numpy(query.target_bbox.astype(np.float32))
-        # Fallback: ±0.1 m cube centred at target_xyz
+    def _target_bbox_world_numpy(query: SpatialQuery) -> np.ndarray:
+        """Target bbox (6,) AABB [x_min,y_min,z_min,x_max,y_max,z_max] in world frame.
+
+        Scene-graph ``target_bbox`` may be either a 6-vector (already AABB) or 8×3
+        corners (24 floats), matching ``ObjectInfo.bbox`` elsewhere in the pipeline.
+        """
+        tb = query.target_bbox
+        if tb is not None:
+            arr = np.asarray(tb, dtype=np.float32).reshape(-1)
+            if arr.size == 6:
+                return arr.astype(np.float32)
+            if arr.size == 24:
+                corners = arr.reshape(8, 3)
+                cmin = corners.min(axis=0)
+                cmax = corners.max(axis=0)
+                return np.concatenate([cmin, cmax]).astype(np.float32)
+            raise ValueError(
+                f"target_bbox must have 6 (AABB) or 24 (8 corners) values, got size {arr.size}"
+            )
         xyz = query.target_xyz.astype(np.float32)
         eps = np.full(3, 0.1, dtype=np.float32)
-        return torch.from_numpy(np.concatenate([xyz - eps, xyz + eps]))
+        return np.concatenate([xyz - eps, xyz + eps]).astype(np.float32)
+
+    def _stack_target_bbox_world_numpy(self, queries: Sequence[SpatialQuery]) -> np.ndarray:
+        """Stack per-query target bbox (6,) → (B, 6)."""
+        return np.stack(
+            [self._target_bbox_world_numpy(q) for q in queries],
+            axis=0,
+        ).astype(np.float32)

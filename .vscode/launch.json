@@ -14,6 +14,24 @@
         "scannet"
       ],
       "cwd": "${workspaceFolder}"
+    },
+    {
+      "name": "Python: Preprocess (cache force rebuild)",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/scripts/preprocess.py",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "args": ["cache.force_rebuild=true"]
+    },
+    {
+      "name": "Python: Train (no W&B)",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/train.py",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "args": ["wandb.enabled=false"]
     }
   ]
 }

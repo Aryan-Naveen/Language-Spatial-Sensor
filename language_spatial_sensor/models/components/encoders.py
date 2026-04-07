@@ -28,7 +28,11 @@ class TextEncoder(nn.Module):
 
     def __init__(self, cfg: LSSConfig) -> None:
         super().__init__()
-        self.bert = AutoModel.from_pretrained(cfg.text_model)
+        # attn_implementation="sdpa" uses PyTorch SDPA, which dispatches to
+        # flash attention automatically when running in bf16/fp16 on CUDA.
+        self.bert = AutoModel.from_pretrained(
+            cfg.text_model, attn_implementation="sdpa"
+        )
         if cfg.freeze_text:
             for p in self.bert.parameters():
                 p.requires_grad_(False)
@@ -87,59 +91,96 @@ class VisionEncoder(nn.Module):
 # ── Spatial relation features ──────────────────────────────────────────────────
 
 def calc_pairwise_locs(
-    bboxes: torch.Tensor,   # (B, N, 6)  [cx, cy, cz, w, h, l]
-    eps: float = 1e-6,
-) -> torch.Tensor:          # (B, N, N, 12)
-    """Compute 12-D geometric pairwise features between all object pairs.
+    bboxes: torch.Tensor,  # (B, N, 6)  [cx, cy, cz, w, h, l]
+    eps: float = 1e-10,
+    pairwise_rel_type: str = "mlp",
+    spatial_dist_norm: bool = True,
+    spatial_dim: int = 12,
+) -> torch.Tensor:
+    """Pairwise geometry for spatial attention bias.
 
-    Feature layout (12 total):
-        [0:3]   delta_center  — i→j offset in world coords
-        [3]     log_dist      — log L2 distance between centres
-        [4:7]   unit_dir      — unit direction vector i→j
-        [7:10]  log_size_ratio— log(w_i/w_j, h_i/h_j, l_i/l_j)
-        [10]    log_vol_ratio — log(vol_i / vol_j)
-        [11]    norm_dist     — dist / (cbrt(vol_i) + cbrt(vol_j))
+    - ``mlp``: concat ``[cx,cy,cz,w,h,l]`` for object *i* and object *j* → **12** dims.
+    - ``center`` / ``vertical_bottom``: normalized distances and direction ratios →
+      ``spatial_dim`` in ``{1, 4, 5}`` (``spatial_dist_norm`` / ``spatial_dim`` ignored for ``mlp``).
     """
-    centers = bboxes[..., :3]   # (B, N, 3)
-    sizes   = bboxes[..., 3:]   # (B, N, 3)  W H L
+    obj_centers = bboxes[..., :3]
+    obj_whls = bboxes[..., 3:6]
 
-    # (B, N, N, 3): offset from j to i  (i = row, j = col)
-    delta = centers.unsqueeze(2) - centers.unsqueeze(1)             # (B, N, N, 3)
+    if pairwise_rel_type == "mlp":
+        obj_locs = torch.cat([obj_centers, obj_whls], dim=-1)  # (B, N, 6)
+        n = obj_locs.size(1)
+        left = obj_locs.unsqueeze(2).expand(-1, -1, n, -1)
+        right = obj_locs.unsqueeze(1).expand(-1, n, -1, -1)
+        return torch.cat([left, right], dim=-1)  # (B, N, N, 12)
 
-    dist     = delta.norm(dim=-1, keepdim=True).clamp(min=eps)      # (B, N, N, 1)
-    log_dist = dist.log()                                            # (B, N, N, 1)
-    unit_dir = delta / dist                                          # (B, N, N, 3)
+    pairwise_locs = obj_centers.unsqueeze(2) - obj_centers.unsqueeze(1)  # (B, N, N, 3)
+    pairwise_dists = torch.sqrt(torch.sum(pairwise_locs**2, dim=-1) + eps)  # (B, N, N)
 
-    si = sizes.unsqueeze(2).expand_as(delta)                        # (B, N, N, 3)
-    sj = sizes.unsqueeze(1).expand_as(delta)                        # (B, N, N, 3)
+    if spatial_dist_norm:
+        max_dists = pairwise_dists.reshape(pairwise_dists.size(0), -1).max(dim=1).values.clamp(
+            min=eps
+        )
+        norm_pairwise_dists = pairwise_dists / max_dists.view(-1, 1, 1)
+    else:
+        norm_pairwise_dists = pairwise_dists
 
-    log_size_ratio = (si / sj.clamp(min=eps)).log()                 # (B, N, N, 3)
+    if spatial_dim == 1:
+        return norm_pairwise_dists.unsqueeze(-1)
 
-    vol_i     = si.prod(dim=-1, keepdim=True)                       # (B, N, N, 1)
-    vol_j     = sj.prod(dim=-1, keepdim=True)
-    log_vol_ratio = (vol_i / vol_j.clamp(min=eps)).log()            # (B, N, N, 1)
+    pairwise_dists_2d = torch.sqrt(torch.sum(pairwise_locs[..., :2] ** 2, dim=-1) + eps)
 
-    scale     = (vol_i.clamp(min=eps) ** (1/3) +
-                 vol_j.clamp(min=eps) ** (1/3)).clamp(min=eps)
-    norm_dist = dist / scale                                         # (B, N, N, 1)
+    if pairwise_rel_type == "center":
+        pairwise_feats = torch.stack(
+            [
+                norm_pairwise_dists,
+                pairwise_locs[..., 2] / pairwise_dists,
+                pairwise_dists_2d / pairwise_dists,
+                pairwise_locs[..., 1] / pairwise_dists_2d,
+                pairwise_locs[..., 0] / pairwise_dists_2d,
+            ],
+            dim=-1,
+        )
+    elif pairwise_rel_type == "vertical_bottom":
+        bottom_centers = obj_centers.clone()
+        bottom_centers[:, :, 2] = bottom_centers[:, :, 2] - obj_whls[:, :, 2]
+        bottom_pairwise_locs = bottom_centers.unsqueeze(2) - bottom_centers.unsqueeze(1)
+        bottom_pairwise_dists = torch.sqrt(torch.sum(bottom_pairwise_locs**2, dim=-1) + eps)
+        bottom_pairwise_dists_2d = torch.sqrt(
+            torch.sum(bottom_pairwise_locs[..., :2] ** 2, dim=-1) + eps
+        )
+        pairwise_feats = torch.stack(
+            [
+                norm_pairwise_dists,
+                bottom_pairwise_locs[..., 2] / bottom_pairwise_dists,
+                bottom_pairwise_dists_2d / bottom_pairwise_dists,
+                pairwise_locs[..., 1] / pairwise_dists_2d,
+                pairwise_locs[..., 0] / pairwise_dists_2d,
+            ],
+            dim=-1,
+        )
+    else:
+        raise ValueError(
+            f"pairwise_rel_type must be 'center', 'vertical_bottom', or 'mlp', got {pairwise_rel_type!r}"
+        )
 
-    return torch.cat(
-        [delta, log_dist, unit_dir, log_size_ratio, log_vol_ratio, norm_dist],
-        dim=-1,
-    )   # (B, N, N, 3+1+3+3+1+1) == (B, N, N, 12)
+    if spatial_dim == 4:
+        pairwise_feats = pairwise_feats[..., 1:]
+    elif spatial_dim != 5:
+        raise ValueError(f"spatial_dim must be 1, 4, or 5 for center/vertical_bottom, got {spatial_dim}")
+
+    return pairwise_feats
 
 
 class SpatialRelationMLP(nn.Module):
     """Wrap calc_pairwise_locs with an optional learned projection.
 
-    The raw 12-D geometric features are projected through a small MLP before
-    being used as spatial bias in MultiHeadAttentionSpatial.  Keeping this as
-    a module (rather than a bare function) lets the projection be learned
-    end-to-end and makes it easy to swap the raw-feature formula later.
+    Raw pairwise features (dim ``cfg.spatial_relation_dim``) are projected through
+    a small MLP before use as spatial bias in ``MultiHeadAttentionSpatial``.
     """
 
     def __init__(self, cfg: LSSConfig) -> None:
         super().__init__()
+        self.cfg = cfg
         self.mlp = nn.Sequential(
             nn.Linear(cfg.spatial_relation_dim, cfg.spatial_mlp_hidden),
             nn.ReLU(),
@@ -147,6 +188,11 @@ class SpatialRelationMLP(nn.Module):
         )
 
     def forward(self, bboxes: torch.Tensor) -> torch.Tensor:
-        # (B, N, 6) → (B, N, N, 12)
-        raw = calc_pairwise_locs(bboxes)
+        raw = calc_pairwise_locs(
+            bboxes,
+            eps=1e-10,
+            pairwise_rel_type=self.cfg.pairwise_rel_type,
+            spatial_dist_norm=self.cfg.spatial_pairwise_dist_norm,
+            spatial_dim=self.cfg.spatial_relation_dim,
+        )
         return self.mlp(raw)
