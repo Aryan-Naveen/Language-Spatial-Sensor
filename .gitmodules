@@ -1,0 +1,3 @@
+[submodule "baselines/3dvista"]
+	path = baselines/3dvista
+	url = https://github.com/3d-vista/3D-ViSTA.git

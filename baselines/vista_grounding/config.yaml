@@ -1,0 +1,85 @@
+# 3D-ViSTA grounding baseline configuration
+# Run from lss/ root: python baselines/vista_grounding/train.py
+# Override any value:  python baselines/vista_grounding/train.py training.lr=3e-4
+
+hydra:
+  job:
+    # Keep cwd = where you launched Python so cache.dir / checkpoint paths resolve correctly.
+    chdir: false
+
+model:
+  # 3D-ViSTA backbone
+  vista_ckpt_path: ""           # path to pretrained ViSTA checkpoint (.pth); leave empty to train from scratch
+  vista_hidden_size: 768        # must match the pretrained checkpoint
+  num_text_layers: 4            # BERT hidden layers
+  num_spatial_layers: 4         # spatial transformer layers in PointTokenizeEncoder
+  spatial_dim: 5                # pairwise spatial feature dim (ViSTA default)
+  dim_loc: 6                    # object location dim: [cx,cy,cz, sx,sy,sz]
+  freeze_layers: 0              # 0 = full finetune; -1 = freeze all ViSTA; N = freeze first N spatial layers
+
+  # GMM head
+  num_components: 5             # K — number of mixture components
+  gmm_hidden_dim: 256           # hidden dim of GMM head MLP
+  min_sigma: 0.001              # floor on Cholesky diagonal (region frame)
+  dropout: 0.1
+
+  # Tokenizer / sequence lengths
+  text_model: bert-base-uncased
+  max_text_len: 50              # matches ViSTA default txt_seq_length
+  max_objects: 80               # O — matches ViSTA default pc_seq_length
+
+training:
+  epochs: 50
+  batch_size: 16                # lower than LSS — per-object PCDs are memory-heavy
+  # PointNet++ uses custom CUDA extensions; torch.compile is unsupported and can trigger bogus Dynamo paths.
+  compile_model: false
+  # RTX 5090 (Blackwell, sm_120): use PyTorch cu128 wheels (torch ≥ 2.7), then rebuild PointNet++ for arch 12.0:
+  #   export TORCH_CUDA_ARCH_LIST="12.0"
+  #   cd baselines/3dvista/model/vision/pointnet2 && pip install --no-build-isolation -e .
+  # Other GPUs: set TORCH_CUDA_ARCH_LIST to your SM (e.g. 8.9 for RTX 4090). See developer.nvidia.com/cuda-gpus.
+  lr: 1.0e-4
+  lang_lr_scale: 0.1            # BERT encoder gets lower LR
+  backbone_lr_scale: 0.1        # ViSTA backbone (point_encoder + unified_encoder)
+  weight_decay: 1.0e-2
+  warmup_steps: 500
+  grad_clip: 1.0
+  precision: bf16               # bf16 | fp16 | fp32
+  num_workers: 4
+  val_every: 1
+  seed: 42
+
+  # GMM loss parameters
+  gmm_lambda_dist: 0.1          # weight on MAP-component distance penalty
+  gmm_entropy_reg: 0.01         # entropy bonus (prevents mixture collapse)
+
+data:
+  data_root: /home/aryannav/mit/data/VLA-3D/VLA-3D_dataset
+  datasets:
+    - unity
+  splits:
+    seed: 42
+    val_unseen_scene_frac: 0.1
+    val_seen_stmt_frac: 0.1
+
+cache:
+  dir: ../../baselines_cache/vista   # relative to baselines/vista_grounding/
+  force_rebuild: false
+
+wandb:
+  project: langmap-lss
+  enabled: true
+  tags:
+    - vista
+    - gmm
+  entity: ""    # set to your wandb entity, or leave empty for default
+  name: ""      # run name; empty = auto-generated
+
+checkpoint:
+  dir: ../../checkpoints/vista
+  save_every: 5
+
+viz:
+  n_scenes: 5
+  n_samples: 5000
+  seed: 0
+  plot_every: 5

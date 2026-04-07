@@ -19,6 +19,9 @@ wandb/
 # Raw dataset (not committed — too large; set data.data_root in config instead)
 data/
 
+# Local venv used to build baselines/3dvista/bundled_scanfamily_meta/
+.build_meta_venv/
+
 # ── Python standard ───────────────────────────────────────────────────────────
 # Byte-compiled / optimized / DLL files
 __pycache__/
