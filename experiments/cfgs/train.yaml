@@ -6,7 +6,7 @@ defaults:
 # ── Training hyperparameters ──────────────────────────────────────────────────
 training:
   epochs: 50
-  batch_size: 256
+  batch_size: 512
   # Learning rate — BERT params use lr * bert_lr_scale
   lr: 1.0e-4
   bert_lr_scale: 0.1

@@ -136,14 +136,14 @@ class Tensorizer:
         return [
             CachedSample(
                 language=queries[i].language,
-                obj_clip_features=t_clip[i],
-                obj_bboxes=t_obj_bbox[i],
-                obj_is_anchor=t_is_anchor[i],
-                obj_padding_mask=t_pad[i],
-                coord_shift=t_shift[i],
-                coord_scale=t_scale[i],
-                target_xyz_world=t_tgt_xyz[i],
-                target_bbox_world=t_tgt_bbox[i],
+                obj_clip_features=t_clip[i].clone(),
+                obj_bboxes=t_obj_bbox[i].clone(),
+                obj_is_anchor=t_is_anchor[i].clone(),
+                obj_padding_mask=t_pad[i].clone(),
+                coord_shift=t_shift[i].clone(),
+                coord_scale=t_scale[i].clone(),
+                target_xyz_world=t_tgt_xyz[i].clone(),
+                target_bbox_world=t_tgt_bbox[i].clone(),
             )
             for i in range(B)
         ]
