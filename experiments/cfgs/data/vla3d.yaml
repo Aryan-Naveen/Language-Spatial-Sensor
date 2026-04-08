@@ -6,10 +6,15 @@ data_root: /home/aryannav/mit/data/VLA-3D/VLA-3D_dataset
 # Full set: [3RScan, ARKitScenes, HM3D, Matterport, Scannet, Unity]
 datasets:
   - Unity
+  - 3RScan
+  - ARKitScenes
+  - HM3D
+  - Matterport
+  - Scannet
 
 splits:
   seed: 42
   # Fraction of scenes withheld entirely for val_unseen.
   val_unseen_scene_frac: 0.05
   # Fraction of statements from seen scenes reserved for val_seen.
-  val_seen_stmt_frac: 0.10
+  val_seen_stmt_frac: 0.05
