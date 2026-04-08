@@ -4,7 +4,12 @@ Pipeline (semantic mode, default when query.object_split is available):
     1. filter_object_points  — keep only non-structural object points
     2. make_semantic_bev     — project to XY, bin into an RGB occupancy image
     3. render_bev            — produce a matplotlib Figure
+
+For training-loop visualization:
+    render_bev_with_sample_overlay  — renders anchor-highlight BEV, then hexbins samples on top
 """
+
+from __future__ import annotations
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -411,10 +416,10 @@ def render_bev(
 
     # Resolve anchor NYU40 labels for highlight mode
     highlight_labels: set[str] | None = None
-    if anchor_highlight and query.anchor_object_ids:
+    if anchor_highlight and query.gt_anchor_object_ids:
         highlight_labels = {
             _nyu40_label(id_to_obj[aid])
-            for aid in query.anchor_object_ids
+            for aid in query.gt_anchor_object_ids
             if aid in id_to_obj
         } - {""}
 
@@ -500,6 +505,101 @@ def render_bev(
     ax.set_title(f"{query.scene_id}\n\"{lang}\"", fontsize=9)
     ax.annotate(note, xy=(0.01, 0.01), xycoords="axes fraction",
                 fontsize=7, color="lightgray")
+
+    fig.tight_layout()
+    return fig
+
+
+# ---------------------------------------------------------------------------
+# Training-loop BEV: SpatialQuery + position samples → heatmap overlay
+# ---------------------------------------------------------------------------
+
+def render_bev_with_sample_overlay(
+    query: SpatialQuery,
+    samples_xyz: np.ndarray,  # (K, 3) position samples in world frame
+    resolution: float = 1, # voxel size in metres for the density overlay
+    heatmap_alpha: float = 0.35,
+) -> plt.Figure:
+    """Render the anchor-highlight BEV, then overlay a per-voxel sample-proportion grid.
+
+    The underlying occupancy grid is produced by ``render_bev(anchor_highlight=True)``
+    — identical to ``scripts/test_viz --anchor_highlight``.
+
+    Each BEV voxel is coloured by the proportion of ``samples_xyz`` that fall in it
+    (count / total_samples).  The colormap is always anchored to [0, 1] so the same
+    proportion value maps to the same colour across every epoch and every scene.
+    Voxels with zero samples are fully transparent, leaving the occupancy grid visible.
+
+    The interface accepts raw position **samples** rather than a distribution object
+    so it generalises to diffusion-transformer output without code changes.
+
+    Args:
+        query:          SpatialQuery with point cloud and anchor metadata loaded.
+        samples_xyz:    (K, 3) array of position samples in world frame.
+        resolution:     Voxel side length in metres — match to BEV resolution.
+        heatmap_alpha:  Opacity of occupied voxels (0 = invisible, 1 = opaque).
+
+    Returns:
+        ``matplotlib.figure.Figure``
+    """
+    fig = render_bev(query, anchor_highlight=True, include_legend=False)
+    ax = fig.axes[0]
+
+    x_min, x_max = ax.get_xlim()
+    y_min, y_max = ax.get_ylim()
+
+    W = max(int(np.ceil((x_max - x_min) / resolution)), 1)
+    H = max(int(np.ceil((y_max - y_min) / resolution)), 1)
+
+    counts, _, _ = np.histogram2d(
+        samples_xyz[:, 0], samples_xyz[:, 1],
+        bins=[W, H],
+        range=[[x_min, x_max], [y_min, y_max]],
+    )
+    proportion = (counts / len(samples_xyz)).T  # (H, W), values in [0, 1]
+
+    # Log-scale for more signal at low densities.
+    # log(proportion + eps) ∈ [log(eps), 0]; remap that fixed interval to [0, 1]
+    # so 0 proportion always → cool end and 1 proportion always → warm end.
+    _EPS = 1e-8
+    _LOG_MIN = np.log(_EPS)   # fixed lower bound ≈ -18.4
+    _LOG_MAX = np.log(0.2)    # fixed upper bound ≈ -1.6; proportions ≥ 0.2 saturate to warm end
+    log_prop = np.log(proportion + _EPS)
+    normalized = np.clip((log_prop - _LOG_MIN) / (_LOG_MAX - _LOG_MIN), 0.0, 1.0)
+
+    rgba = plt.cm.plasma(normalized)             # (H, W, 4)
+    rgba[..., 3] = heatmap_alpha                 # uniform alpha — colour everywhere
+
+    # ── Mask voxels outside all region bounding boxes ─────────────────────────
+    # Use every region bbox in the scene graph (including regions excluded from
+    # the BEV render due to invalid semantics) as the authoritative scene extent.
+    # Voxels whose centres fall outside every bbox are set to alpha=0 (white).
+    region_boxes = []
+    for region in query.scene_graph.regions:
+        m = region.metadata
+        if all(k in m for k in ("bbox_x_min", "bbox_x_max", "bbox_y_min", "bbox_y_max")):
+            region_boxes.append((
+                float(m["bbox_x_min"]), float(m["bbox_x_max"]),
+                float(m["bbox_y_min"]), float(m["bbox_y_max"]),
+            ))
+
+    vox_cx = x_min + (np.arange(W) + 0.5) * resolution  # (W,)
+    vox_cy = y_min + (np.arange(H) + 0.5) * resolution  # (H,)
+    cx_grid, cy_grid = np.meshgrid(vox_cx, vox_cy)       # (H, W) each
+
+    inside = np.zeros((H, W), dtype=bool)
+    for rx0, rx1, ry0, ry1 in region_boxes:
+        inside |= (cx_grid >= rx0) & (cx_grid <= rx1) & (cy_grid >= ry0) & (cy_grid <= ry1)
+
+    rgba[~inside, 3] = 0.0
+
+    ax.imshow(
+        rgba,
+        origin="lower",
+        extent=[x_min, x_max, y_min, y_max],
+        interpolation="nearest",
+        zorder=4,  # above BEV image, below gold star (zorder=5)
+    )
 
     fig.tight_layout()
     return fig
