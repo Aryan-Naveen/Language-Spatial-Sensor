@@ -1,0 +1,48 @@
+defaults:
+  - data: vla3d
+  - _self_
+
+# ── Checkpoint ────────────────────────────────────────────────────────────────
+# Path relative to the lss/ root (where you launch the script from).
+checkpoint: checkpoints/best.pt
+
+# ── CLIP model (must match training) ─────────────────────────────────────────
+clip_model: ViT-B/32
+
+# ── Inference device ──────────────────────────────────────────────────────────
+device: cuda
+
+# ── Sequence lengths (must match training config) ─────────────────────────────
+max_objects: 100
+max_text_len: 64
+
+# ── Ollama / proposer ─────────────────────────────────────────────────────────
+ollama:
+  model: qwen2.5:32b
+  base_url: http://localhost:11434
+  max_proposals: 8
+  timeout: 120
+  # Hard cap on generated tokens. Without explanations, 8 proposals need ~400
+  # tokens. Set higher if you increase max_proposals.
+  num_predict: 400
+
+# ── Concurrency ───────────────────────────────────────────────────────────────
+# Number of parallel eval workers (each calls Ollama + model independently).
+# Ollama queues requests internally, so more workers keeps it saturated.
+num_workers: 4
+
+# ── Point cloud loading ───────────────────────────────────────────────────────
+# Set to false to skip loading .ply files (faster if pipeline doesn't use them)
+load_pc: true
+
+# ── Hydra output ─────────────────────────────────────────────────────────────
+# Hydra changes the working directory to hydra.run.dir before main() is called.
+# Benchmark results (val_seen/, val_unseen/) are written there alongside the
+# resolved .hydra/config.yaml for full reproducibility.
+# Override on CLI:  hydra.run.dir=outputs/benchmarks/my_run
+hydra:
+  run:
+    dir: outputs/benchmarks/${now:%Y-%m-%d_%H-%M-%S}
+  sweep:
+    dir: multirun/benchmarks/${now:%Y-%m-%d_%H-%M-%S}
+    subdir: ${hydra.job.num}

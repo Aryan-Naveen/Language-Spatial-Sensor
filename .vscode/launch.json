@@ -32,6 +32,53 @@
       "console": "integratedTerminal",
       "cwd": "${workspaceFolder}",
       "args": ["wandb.enabled=false"]
+    },
+    {
+      "name": "Eval: LSS Pipeline",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/scripts/eval_pipeline.py",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "args": []
+    },
+    {
+      "name": "Eval: LSS Pipeline (smoke test)",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/scripts/eval_pipeline.py",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "args": [
+        "data.datasets=[Unity]",
+        "hydra.run.dir=outputs/benchmarks/smoke_test"
+      ]
+    },
+    {
+      "name": "Eval: LSS Pipeline (cProfile)",
+      "type": "python",
+      "request": "launch",
+      "module": "cProfile",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "args": [
+        "-o", "outputs/profile.prof",
+        "scripts/eval_pipeline.py",
+        "data.datasets=[Unity]",
+        "hydra.run.dir=outputs/benchmarks/profile_run"
+      ]
+    },
+    {
+      "name": "Eval: LSS Pipeline (named run)",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/scripts/eval_pipeline.py",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "args": [
+        "hydra.run.dir=outputs/benchmarks/lss_v1",
+        "checkpoint=checkpoints/best.pt"
+      ]
     }
   ]
 }
