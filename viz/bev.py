@@ -4,6 +4,7 @@ Pipeline (semantic mode, default when query.object_split is available):
     1. filter_object_points  — keep only non-structural object points
     2. make_semantic_bev     — project to XY, bin into an RGB occupancy image
     3. render_bev            — produce a matplotlib Figure
+    4. render_bev_underlay_rgb — raster BEV only (no axes/legend) for composites / GIFs
 
 For training-loop visualization:
     render_bev_with_sample_overlay  — renders anchor-highlight BEV, then hexbins samples on top
@@ -13,6 +14,8 @@ Debug / alignment:
 """
 
 from __future__ import annotations
+
+import io
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -374,6 +377,163 @@ def _build_legend_handles(
 # Full render pipeline
 # ---------------------------------------------------------------------------
 
+def _populate_semantic_bev_axis(
+    ax,
+    query: SpatialQuery,
+    resolution: float,
+    *,
+    anchor_highlight: bool = False,
+) -> tuple[list[float], np.ndarray, dict, set[str] | None]:
+    """Draw semantic BEV image, region boxes, and target star on ``ax``.
+
+    Returns ``extent`` as ``[x_min, x_max, y_min, y_max]``, ``split_obj``,
+    ``id_to_obj``, and ``highlight_labels``.
+    """
+    if query.object_split is None:
+        raise ValueError("SpatialQuery.object_split is required")
+
+    z_min, z_max = fit_floor_ceiling_semantic(query.scene_graph, query.target_xyz, query.pc)
+    pc_obj, split_obj = filter_object_points(
+        query.pc, query.object_split, query.scene_graph,
+        z_min=z_min, z_max=z_max,
+    )
+    id_to_obj = {obj.id: obj for obj in query.scene_graph.objects}
+
+    highlight_labels: set[str] | None = None
+    if anchor_highlight and query.gt_anchor_object_ids:
+        highlight_labels = {
+            _nyu40_label(id_to_obj[aid])
+            for aid in query.gt_anchor_object_ids
+            if aid in id_to_obj
+        } - {""}
+
+    image, meta = make_semantic_bev(
+        pc_obj, split_obj, query.scene_graph,
+        resolution=resolution,
+        highlight_labels=highlight_labels,
+    )
+    extent = [
+        meta["x_min"],
+        meta["x_min"] + meta["width"] * resolution,
+        meta["y_min"],
+        meta["y_min"] + meta["height"] * resolution,
+    ]
+    ax.imshow(image, origin="lower", interpolation="nearest", extent=extent)
+
+    _REGION_MIN_POINTS = 50
+    obj_to_region: dict[int, int] = {
+        obj.id: int(obj.metadata["region_id"])
+        for obj in query.scene_graph.objects
+        if "region_id" in obj.metadata
+    }
+    region_point_counts: dict[int, int] = {}
+    for oid in split_obj:
+        rid = obj_to_region.get(int(oid))
+        if rid is not None:
+            region_point_counts[rid] = region_point_counts.get(rid, 0) + 1
+
+    regions = query.scene_graph.regions
+    if len(regions) > 1:
+        region_colors = plt.cm.Set2.colors
+        color_idx = 0
+        for region in regions:
+            m = region.metadata
+            bbox_keys = ("bbox_x_min", "bbox_x_max", "bbox_y_min", "bbox_y_max")
+            if not all(k in m for k in bbox_keys):
+                continue
+            if region.label.lower().strip() not in VALID_REGION_LABELS:
+                continue
+            if region_point_counts.get(region.id, 0) < _REGION_MIN_POINTS:
+                continue
+
+            rx0, rx1 = m["bbox_x_min"], m["bbox_x_max"]
+            ry0, ry1 = m["bbox_y_min"], m["bbox_y_max"]
+            color = region_colors[color_idx % len(region_colors)]
+            color_idx += 1
+            rect = mpatches.FancyBboxPatch(
+                (rx0, ry0), rx1 - rx0, ry1 - ry0,
+                boxstyle="square,pad=0",
+                linewidth=1.8, edgecolor=color, facecolor="none",
+                linestyle="--", zorder=4,
+            )
+            ax.add_patch(rect)
+            ax.text(
+                rx0 + (rx1 - rx0) * 0.02, ry1,
+                region.label or f"region {region.id}",
+                fontsize=11, color=color, fontweight="bold",
+                va="bottom", ha="left", zorder=6,
+                bbox=dict(boxstyle="round,pad=0.15", fc="white", ec=color,
+                          alpha=0.75, linewidth=0.8),
+            )
+
+    tx, ty = float(query.target_xyz[0]), float(query.target_xyz[1])
+    ax.plot(tx, ty, marker="*", color="#FFD700", markersize=16,
+            markeredgecolor="black", markeredgewidth=0.8, zorder=5)
+
+    return extent, split_obj, id_to_obj, highlight_labels
+
+
+def render_bev_underlay_rgb(
+    query: SpatialQuery,
+    resolution: float,
+    *,
+    dpi: int = 120,
+    max_inches: float = 10.0,
+    anchor_highlight: bool = False,
+) -> tuple[np.ndarray, tuple[float, float, float, float]]:
+    """Rasterise semantic BEV (map + regions + target) with no axes, legend, or title.
+
+    Returns ``(rgb_uint8 (H,W,3), (left, right, bottom, top))`` for one ``imshow`` layer
+    so composites (e.g. GIFs) do not stack matplotlib decorations.
+
+    The array is **flipped vertically** so that ``imshow(..., origin="lower", extent=…)``
+    matches world metres (row 0 = small *y*). PNG files store row 0 at the image top
+    (*large* *y*), which would invert the map and text if loaded without this flip.
+    """
+    if query.object_split is None:
+        raise ValueError("render_bev_underlay_rgb requires object_split")
+
+    fig, ax = plt.subplots()
+    ax.set_facecolor("white")
+    extent_li, _, _, _ = _populate_semantic_bev_axis(
+        ax, query, resolution, anchor_highlight=anchor_highlight,
+    )
+    L, R, B, T = extent_li
+    xspan, yspan = R - L, T - B
+    if xspan < 1e-9:
+        xspan = 1.0
+    if yspan < 1e-9:
+        yspan = 1.0
+    if xspan >= yspan:
+        fw = float(max_inches)
+        fh = max_inches * yspan / xspan
+    else:
+        fh = float(max_inches)
+        fw = max_inches * xspan / yspan
+    fig.set_size_inches(fw, fh, forward=True)
+    fig.set_dpi(dpi)
+
+    ax.axis("off")
+    ax.set_xlim(L, R)
+    ax.set_ylim(B, T)
+    ax.set_aspect("equal")
+    fig.subplots_adjust(0.0, 0.0, 1.0, 1.0)
+
+    fig.canvas.draw()
+    buf = io.BytesIO()
+    bb = ax.get_tightbbox(fig.canvas.get_renderer())
+    bb_in = bb.transformed(fig.dpi_scale_trans.inverted())
+    fig.savefig(buf, format="png", bbox_inches=bb_in, pad_inches=0, dpi=dpi)
+    plt.close(fig)
+
+    from PIL import Image
+
+    img = np.asarray(Image.open(buf).convert("RGB"), dtype=np.uint8)
+    # PNG row 0 = screen top = large y; imshow(..., origin="lower") expects row 0 = ymin.
+    img = np.ascontiguousarray(np.flipud(img))
+    return img, (float(L), float(R), float(B), float(T))
+
+
 def render_bev(
     query: SpatialQuery,
     resolution: float = 0.05,
@@ -405,39 +565,9 @@ def render_bev(
         print(f"Cannot render semantic BEV for scene '{query.scene_id}' (missing object_split).")
         return fig
 
-    # Fit floor/ceiling semantically using scene-graph floor/ceiling objects
-    z_min, z_max = fit_floor_ceiling_semantic(query.scene_graph, query.target_xyz, query.pc)
-
-    # Positive allowlist: palette labels only, within z-range
-    pc_obj, split_obj = filter_object_points(
-        query.pc, query.object_split, query.scene_graph,
-        z_min=z_min, z_max=z_max,
+    extent, split_obj, id_to_obj, highlight_labels = _populate_semantic_bev_axis(
+        ax, query, resolution, anchor_highlight=anchor_highlight,
     )
-
-    # Build once; reused for highlight resolution and legend
-    id_to_obj = {obj.id: obj for obj in query.scene_graph.objects}
-
-    # Resolve anchor NYU40 labels for highlight mode
-    highlight_labels: set[str] | None = None
-    if anchor_highlight and query.gt_anchor_object_ids:
-        highlight_labels = {
-            _nyu40_label(id_to_obj[aid])
-            for aid in query.gt_anchor_object_ids
-            if aid in id_to_obj
-        } - {""}
-
-    image, meta = make_semantic_bev(
-        pc_obj, split_obj, query.scene_graph,
-        resolution=resolution,
-        highlight_labels=highlight_labels,
-    )
-    extent = [
-        meta["x_min"],
-        meta["x_min"] + meta["width"]  * resolution,
-        meta["y_min"],
-        meta["y_min"] + meta["height"] * resolution,
-    ]
-    ax.imshow(image, origin="lower", interpolation="nearest", extent=extent)
 
     if include_legend:
         legend_handles = _build_legend_handles(split_obj, highlight_labels, id_to_obj)
@@ -445,62 +575,12 @@ def render_bev(
             ax.legend(handles=legend_handles, loc="upper right", fontsize=6,
                       framealpha=0.8, ncol=2)
 
+    z_min, z_max = fit_floor_ceiling_semantic(query.scene_graph, query.target_xyz, query.pc)
+    pc_obj, _ = filter_object_points(
+        query.pc, query.object_split, query.scene_graph,
+        z_min=z_min, z_max=z_max,
+    )
     note = f"{len(pc_obj):,} object pts"
-
-    # Region bounding boxes — only when there are multiple regions
-    _REGION_MIN_POINTS = 50  # minimum BEV points from a region to draw its box
-
-    obj_to_region: dict[int, int] = {
-        obj.id: int(obj.metadata["region_id"])
-        for obj in query.scene_graph.objects
-        if "region_id" in obj.metadata
-    }
-    region_point_counts: dict[int, int] = {}
-    for oid in split_obj:
-        rid = obj_to_region.get(int(oid))
-        if rid is not None:
-            region_point_counts[rid] = region_point_counts.get(rid, 0) + 1
-
-    regions = query.scene_graph.regions
-    if len(regions) > 1:
-        region_colors = plt.cm.Set2.colors  # 8 distinct pastel colours
-        color_idx = 0
-        for region in regions:
-            m = region.metadata
-            bbox_keys = ("bbox_x_min", "bbox_x_max", "bbox_y_min", "bbox_y_max")
-            if not all(k in m for k in bbox_keys):
-                continue
-
-            if region.label.lower().strip() not in VALID_REGION_LABELS:
-                continue
-
-            if region_point_counts.get(region.id, 0) < _REGION_MIN_POINTS:
-                continue
-
-            rx0, rx1 = m["bbox_x_min"], m["bbox_x_max"]
-            ry0, ry1 = m["bbox_y_min"], m["bbox_y_max"]
-            color = region_colors[color_idx % len(region_colors)]
-            color_idx += 1
-            rect = mpatches.FancyBboxPatch(
-                (rx0, ry0), rx1 - rx0, ry1 - ry0,
-                boxstyle="square,pad=0",
-                linewidth=1.8, edgecolor=color, facecolor="none",
-                linestyle="--", zorder=4,
-            )
-            ax.add_patch(rect)
-            ax.text(
-                rx0 + (rx1 - rx0) * 0.02, ry1,
-                region.label or f"region {region.id}",
-                fontsize=11, color=color, fontweight="bold",
-                va="bottom", ha="left", zorder=6,
-                bbox=dict(boxstyle="round,pad=0.15", fc="white", ec=color,
-                          alpha=0.75, linewidth=0.8),
-            )
-
-    # Target marker — gold star
-    tx, ty = float(query.target_xyz[0]), float(query.target_xyz[1])
-    ax.plot(tx, ty, marker="*", color="#FFD700", markersize=16,
-            markeredgecolor="black", markeredgewidth=0.8, zorder=5)
 
     ax.set_xlabel("x (m)")
     ax.set_ylabel("y (m)")

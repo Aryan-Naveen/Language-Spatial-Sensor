@@ -1,3 +1,3 @@
-from viz.bev import make_bev_grid, render_bev
+from viz.bev import make_bev_grid, render_bev, render_bev_underlay_rgb
 
-__all__ = ["make_bev_grid", "render_bev"]
+__all__ = ["make_bev_grid", "render_bev", "render_bev_underlay_rgb"]
