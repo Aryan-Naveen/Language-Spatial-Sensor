@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import numpy as np
 
 from language_spatial_sensor.core.schema import (

@@ -7,6 +7,9 @@ Pipeline (semantic mode, default when query.object_split is available):
 
 For training-loop visualization:
     render_bev_with_sample_overlay  — renders anchor-highlight BEV, then hexbins samples on top
+
+Debug / alignment:
+    add_bev_trajectory_overlay  — world XY polyline on a BEV axis (e.g. camera poses)
 """
 
 from __future__ import annotations
@@ -508,6 +511,32 @@ def render_bev(
 
     fig.tight_layout()
     return fig
+
+
+def add_bev_trajectory_overlay(
+    ax,
+    xy: np.ndarray,
+    *,
+    color: str = "cyan",
+    linewidth: float = 2.0,
+    alpha: float = 0.9,
+    zorder: float = 10,
+    **kwargs,
+) -> None:
+    """Draw a world-frame XY polyline on a BEV axis (e.g. after ``render_bev``).
+
+    Uses the same coordinates as ``imshow(..., extent=[x_min, x_max, y_min, y_max])``.
+    """
+    if xy.size == 0:
+        return
+    xy = np.asarray(xy, dtype=np.float64)
+    if xy.ndim != 2 or xy.shape[1] < 2:
+        raise ValueError("xy must be (N, 2) with columns x, y")
+    ax.plot(
+        xy[:, 0], xy[:, 1],
+        color=color, linewidth=linewidth, alpha=alpha, zorder=zorder,
+        **kwargs,
+    )
 
 
 # ---------------------------------------------------------------------------
