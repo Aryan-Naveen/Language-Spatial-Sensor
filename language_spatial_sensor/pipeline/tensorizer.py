@@ -21,7 +21,9 @@ import torch
 
 from language_spatial_sensor.core.schema import (
     CachedSample,
+    GroundedQuery,
     RegionInfo,
+    SceneGraph,
     SpatialQuery,
 )
 
@@ -91,14 +93,30 @@ class Tensorizer:
 
     def tensorize_batch(self, queries: Sequence[SpatialQuery]) -> list[CachedSample]:
         """Convert many SpatialQueries with batched NumPy work and few torch conversions."""
+        grounded = [GroundedQuery.from_spatial_query(q) for q in queries]
+        return self.tensorize_grounded_batch(grounded)
+
+    def tensorize_grounded(self, query: GroundedQuery) -> CachedSample:
+        """Convert a single GroundedQuery into a CachedSample.
+
+        Use this at inference time when a Proposer supplies the grounding hypothesis.
+        """
+        return self.tensorize_grounded_batch([query])[0]
+
+    def tensorize_grounded_batch(self, queries: Sequence[GroundedQuery]) -> list[CachedSample]:
+        """Like tensorize_batch but accepts GroundedQuery objects.
+
+        The grounding (anchor_room_id, anchor_object_ids, language) may come from
+        ground-truth annotations *or* from a Proposer — the tensorizer does not care.
+        """
         if not queries:
             return []
 
         B = len(queries)
         region_bboxes = np.zeros((B, 6), dtype=np.float32)
-        region_ids: list[int | None] = []
+        region_ids: list[int] = []
         for i, q in enumerate(queries):
-            rid, bbox = self._resolve_region(q)
+            rid, bbox = self._resolve_region(q.scene_id, q.scene_graph, q.grounding.anchor_room_id)
             region_ids.append(rid)
             region_bboxes[i] = bbox
 
@@ -111,7 +129,8 @@ class Tensorizer:
 
         for i, q in enumerate(queries):
             self._tensorize_objects_into(
-                q,
+                q.scene_graph,
+                q.grounding.anchor_object_ids,
                 region_ids[i],
                 coord_shift_b[i],
                 coord_scale_b[i],
@@ -121,8 +140,12 @@ class Tensorizer:
                 padding_mask[i],
             )
 
-        target_xyz = np.stack([q.target_xyz.astype(np.float32) for q in queries], axis=0)
-        target_bbox_world = self._stack_target_bbox_world_numpy(queries)
+        target_xyz = np.stack([
+            q.target_xyz.astype(np.float32) if q.target_xyz is not None
+            else np.zeros(3, dtype=np.float32)
+            for q in queries
+        ], axis=0)
+        target_bbox_world = self._stack_target_bbox_world_grounded(queries)
 
         t_clip = torch.from_numpy(clip_feats)
         t_obj_bbox = torch.from_numpy(bboxes)
@@ -135,7 +158,7 @@ class Tensorizer:
 
         return [
             CachedSample(
-                language=queries[i].language,
+                language=queries[i].grounding.language,
                 obj_clip_features=t_clip[i],
                 obj_bboxes=t_obj_bbox[i],
                 obj_is_anchor=t_is_anchor[i],
@@ -151,19 +174,19 @@ class Tensorizer:
     # ── Internal steps ────────────────────────────────────────────────────────
 
     def _resolve_region(
-        self, query: SpatialQuery
-    ) -> tuple[int | None, np.ndarray]:
+        self,
+        scene_id: str,
+        scene_graph: SceneGraph,
+        anchor_room_id: int,
+    ) -> tuple[int, np.ndarray]:
         """Return (region_id, bbox_6) where bbox_6 = [x_min,y_min,z_min,x_max,y_max,z_max]."""
-        region_id = query.gt_anchor_room_id
+        for region in scene_graph.regions:
+            if region.id == anchor_room_id:
+                bbox = self._region_bbox(region)
+                if bbox is not None:
+                    return anchor_room_id, bbox
 
-        if region_id is not None:
-            for region in query.scene_graph.regions:
-                if region.id == region_id:
-                    bbox = self._region_bbox(region)
-                    if bbox is not None:
-                        return region_id, bbox
-
-        raise ValueError(f"Region ID {region_id} not found in scene graph for scene '{query.scene_id}'")
+        raise ValueError(f"Region ID {anchor_room_id} not found in scene graph for scene '{scene_id}'")
 
     @staticmethod
     def _region_bbox(region: RegionInfo) -> np.ndarray | None:
@@ -201,20 +224,21 @@ class Tensorizer:
 
     def _tensorize_objects_into(
         self,
-        query: SpatialQuery,
+        scene_graph: SceneGraph,
+        anchor_object_ids: list[int],
         region_id: int | None,
-        coord_shift: np.ndarray,   # (3,)
-        coord_scale: np.ndarray,   # (3,)
-        out_clip: np.ndarray,       # (max_objects, clip_dim)
-        out_bboxes: np.ndarray,     # (max_objects, 6)
-        out_is_anchor: np.ndarray,  # (max_objects,)
-        out_padding_mask: np.ndarray,  # (max_objects,)
+        coord_shift: np.ndarray,      # (3,)
+        coord_scale: np.ndarray,      # (3,)
+        out_clip: np.ndarray,         # (max_objects, clip_dim)
+        out_bboxes: np.ndarray,       # (max_objects, 6)
+        out_is_anchor: np.ndarray,    # (max_objects,)
+        out_padding_mask: np.ndarray, # (max_objects,)
     ) -> None:
         """Crop objects to region, normalize to region frame, pad to max_objects (in-place)."""
-        anchor_ids: set[int] = set(query.gt_anchor_object_ids or [])
+        anchor_ids: set[int] = set(anchor_object_ids)
 
         objs = [
-            obj for obj in query.scene_graph.objects
+            obj for obj in scene_graph.objects
             if region_id is None or obj.metadata.get("region_id") == region_id
         ]
 
@@ -272,3 +296,28 @@ class Tensorizer:
             [self._target_bbox_world_numpy(q) for q in queries],
             axis=0,
         ).astype(np.float32)
+
+    def _stack_target_bbox_world_grounded(self, queries: Sequence[GroundedQuery]) -> np.ndarray:
+        """Stack per-GroundedQuery target bbox (6,) → (B, 6). Returns zeros when target is unknown."""
+        rows = []
+        for q in queries:
+            if q.target_bbox is not None or q.target_xyz is not None:
+                # Reuse SpatialQuery helper by constructing a minimal adapter
+                tb = q.target_bbox
+                xyz = q.target_xyz
+                if tb is not None:
+                    arr = np.asarray(tb, dtype=np.float32).reshape(-1)
+                    if arr.size == 6:
+                        rows.append(arr)
+                        continue
+                    if arr.size == 24:
+                        corners = arr.reshape(8, 3)
+                        rows.append(np.concatenate([corners.min(0), corners.max(0)]).astype(np.float32))
+                        continue
+                if xyz is not None:
+                    eps = np.full(3, 0.1, dtype=np.float32)
+                    xyz32 = xyz.astype(np.float32)
+                    rows.append(np.concatenate([xyz32 - eps, xyz32 + eps]))
+                    continue
+            rows.append(np.zeros(6, dtype=np.float32))
+        return np.stack(rows, axis=0).astype(np.float32)

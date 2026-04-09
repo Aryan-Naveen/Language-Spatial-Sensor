@@ -66,6 +66,71 @@ class SpatialQuery:
 
 
 @dataclass
+class Grounding:
+    """A single grounding hypothesis: the proposer's binding of scene elements to a language utterance.
+
+    Contains which room to ground in, which objects serve as anchors, and the utterance.
+    May come from ground-truth annotations (training) or a Proposer (inference).
+    """
+    anchor_room_id: int
+    anchor_object_ids: list[int]
+    language: str
+
+
+@dataclass
+class GroundedQuery:
+    """Scene context paired with a single Grounding hypothesis — the tensorizer's input at inference time.
+
+    At training time: build via ``GroundedQuery.from_spatial_query(sq)`` to lift gt fields.
+    At inference time: build from a raw scene + a ``Grounding`` emitted by the Proposer.
+
+    ``target_xyz`` / ``target_bbox`` are ``None`` when GT supervision is unavailable (pure inference).
+    They can be set for evaluation so that the same type is used across the pipeline.
+    """
+    scene_id: str
+    scene_graph: SceneGraph
+    pc: np.ndarray
+    object_split: np.ndarray
+    grounding: Grounding
+    target_xyz: np.ndarray | None = None
+    target_bbox: np.ndarray | None = None
+    metadata: dict = field(default_factory=dict)
+
+    @classmethod
+    def from_spatial_query(
+        cls,
+        query: "SpatialQuery",
+        grounding: "Grounding | None" = None,
+    ) -> "GroundedQuery":
+        """Construct from a SpatialQuery, optionally overriding the grounding.
+
+        If *grounding* is ``None``, the gt anchor fields on *query* are used.
+        Raises ``ValueError`` if those fields are ``None`` and no override is given.
+        """
+        if grounding is None:
+            if query.gt_anchor_room_id is None:
+                raise ValueError(
+                    "SpatialQuery.gt_anchor_room_id is None; "
+                    "provide an explicit Grounding or set the gt field."
+                )
+            grounding = Grounding(
+                anchor_room_id=query.gt_anchor_room_id,
+                anchor_object_ids=list(query.gt_anchor_object_ids or []),
+                language=query.language,
+            )
+        return cls(
+            scene_id=query.scene_id,
+            scene_graph=query.scene_graph,
+            pc=query.pc,
+            object_split=query.object_split,
+            grounding=grounding,
+            target_xyz=query.target_xyz,
+            target_bbox=query.target_bbox,
+            metadata=query.metadata,
+        )
+
+
+@dataclass
 class CachedSample:
     """What gets written to disk by scripts/preprocess.py.
 
