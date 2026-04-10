@@ -75,6 +75,7 @@ class Grounding:
     anchor_room_id: int
     anchor_object_ids: list[int]
     language: str
+    confidence: float = 1.0
 
 
 @dataclass

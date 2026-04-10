@@ -239,7 +239,7 @@ def make_bev_grid(
 
 
 _GRAYSCALE = np.array([0.55, 0.55, 0.55], dtype=np.float32)
-_HIGHLIGHT  = np.array([1.00, 0.30, 0.20], dtype=np.float32)  # vivid coral-red
+_HIGHLIGHT  = np.array([0.20, 0.50, 0.90], dtype=np.float32)  # steel blue
 
 
 def make_semantic_bev(
@@ -249,6 +249,7 @@ def make_semantic_bev(
     resolution: float = 0.05,
     margin: float = 0.5,
     highlight_labels: set[str] | None = None,
+    highlight_object_ids: set[int] | None = None,
 ) -> tuple[np.ndarray, dict]:
     """Semantic RGB BEV image.
 
@@ -258,6 +259,9 @@ def make_semantic_bev(
     When ``highlight_labels`` is provided the image switches to a two-tone
     mode: cells whose label is in the set are drawn in coral-red, all other
     occupied cells are rendered in grayscale.
+
+    When ``highlight_object_ids`` is provided, highlights those specific
+    object IDs in coral-red (takes precedence over ``highlight_labels``).
 
     Returns:
         image: (H, W, 3) float32 RGB image.
@@ -282,6 +286,8 @@ def make_semantic_bev(
         if obj is None:
             return _GRAYSCALE
         lbl = _nyu40_label(obj)
+        if highlight_object_ids is not None:
+            return _HIGHLIGHT if oid in highlight_object_ids else _label_gray(lbl or str(oid))
         if highlight_labels is not None:
             return _HIGHLIGHT if lbl in highlight_labels else _label_gray(lbl)
         return np.array(nyu40_to_color(lbl), dtype=np.float32)
@@ -310,12 +316,16 @@ def make_semantic_bev(
     # Sort points by z ascending so higher-z objects paint over lower-z ones
     z_order = np.argsort(pc[:, 2])
 
-    if highlight_labels is not None:
-        is_highlight = np.array([
-            _nyu40_label(id_to_obj[int(oid)]) in highlight_labels
-            if int(oid) in id_to_obj else False
-            for oid in object_split
-        ])
+    in_highlight_mode = highlight_object_ids is not None or highlight_labels is not None
+    if in_highlight_mode:
+        if highlight_object_ids is not None:
+            is_highlight = np.array([int(oid) in highlight_object_ids for oid in object_split])
+        else:
+            is_highlight = np.array([
+                _nyu40_label(id_to_obj[int(oid)]) in highlight_labels
+                if int(oid) in id_to_obj else False
+                for oid in object_split
+            ])
         # Within each group respect z-order; highlighted group goes on top of background
         hi_in_z = is_highlight[z_order]
         for idx in (z_order[~hi_in_z], z_order[hi_in_z]):
@@ -336,23 +346,42 @@ def _build_legend_handles(
     split_obj: np.ndarray,
     highlight_labels: set[str] | None,
     id_to_obj: dict,
+    highlight_object_ids: set[int] | None = None,
 ) -> list[mpatches.Patch]:
     """Build matplotlib legend patches for the BEV image."""
     present_ids = set(int(i) for i in np.unique(split_obj))
 
-    if highlight_labels:
+    if highlight_object_ids is not None:
         gray_seen: dict[str, np.ndarray] = {}
+        hi_labels: list[str] = []
         for oid in present_ids:
             obj = id_to_obj.get(oid)
             if obj is None:
                 continue
             lbl = _nyu40_label(obj)
-            if lbl and lbl not in highlight_labels and lbl not in gray_seen:
+            if oid in highlight_object_ids:
+                hi_labels.append(lbl or str(oid))
+            elif lbl and lbl not in gray_seen:
                 gv = 0.30 + (abs(hash(lbl)) % 256) / 256 * 0.42
                 gray_seen[lbl] = np.array([gv, gv, gv])
+        label_str = ", ".join(sorted(set(hi_labels))) if hi_labels else "anchors"
+        return [
+            mpatches.Patch(color=_HIGHLIGHT, label=label_str),
+            *[mpatches.Patch(color=c, label=lbl) for lbl, c in sorted(gray_seen.items())],
+        ]
+    elif highlight_labels:
+        gray_seen2: dict[str, np.ndarray] = {}
+        for oid in present_ids:
+            obj = id_to_obj.get(oid)
+            if obj is None:
+                continue
+            lbl = _nyu40_label(obj)
+            if lbl and lbl not in highlight_labels and lbl not in gray_seen2:
+                gv = 0.30 + (abs(hash(lbl)) % 256) / 256 * 0.42
+                gray_seen2[lbl] = np.array([gv, gv, gv])
         return [
             mpatches.Patch(color=_HIGHLIGHT, label=", ".join(sorted(highlight_labels))),
-            *[mpatches.Patch(color=c, label=lbl) for lbl, c in sorted(gray_seen.items())],
+            *[mpatches.Patch(color=c, label=lbl) for lbl, c in sorted(gray_seen2.items())],
         ]
     else:
         seen: dict[str, tuple[float, float, float]] = {}
@@ -377,6 +406,8 @@ def render_bev(
     figsize: tuple[int, int] = (8, 8),
     include_legend: bool = True,
     anchor_highlight: bool = False,
+    highlight_object_ids: set[int] | None = None,
+    show_target: bool = True,
 ) -> plt.Figure:
     """Render a BEV figure from a SpatialQuery.
 
@@ -391,6 +422,9 @@ def render_bev(
         anchor_highlight: When True, renders all occupied cells in grayscale
             except objects sharing a semantic class with any anchor object,
             which are drawn in coral-red.
+        highlight_object_ids: When provided, highlights these specific object
+            IDs in coral-red (takes precedence over anchor_highlight).
+        show_target: When False, suppresses the gold-star GT target marker.
 
     Returns:
         ``matplotlib.figure.Figure`` — call ``.show()`` or ``.savefig(path)``.
@@ -414,9 +448,9 @@ def render_bev(
     # Build once; reused for highlight resolution and legend
     id_to_obj = {obj.id: obj for obj in query.scene_graph.objects}
 
-    # Resolve anchor NYU40 labels for highlight mode
+    # Resolve highlight mode: explicit object IDs take precedence over label-based anchor_highlight
     highlight_labels: set[str] | None = None
-    if anchor_highlight and query.gt_anchor_object_ids:
+    if highlight_object_ids is None and anchor_highlight and query.gt_anchor_object_ids:
         highlight_labels = {
             _nyu40_label(id_to_obj[aid])
             for aid in query.gt_anchor_object_ids
@@ -427,6 +461,7 @@ def render_bev(
         pc_obj, split_obj, query.scene_graph,
         resolution=resolution,
         highlight_labels=highlight_labels,
+        highlight_object_ids=highlight_object_ids,
     )
     extent = [
         meta["x_min"],
@@ -437,7 +472,7 @@ def render_bev(
     ax.imshow(image, origin="lower", interpolation="nearest", extent=extent)
 
     if include_legend:
-        legend_handles = _build_legend_handles(split_obj, highlight_labels, id_to_obj)
+        legend_handles = _build_legend_handles(split_obj, highlight_labels, id_to_obj, highlight_object_ids)
         if legend_handles:
             ax.legend(handles=legend_handles, loc="upper right", fontsize=6,
                       framealpha=0.8, ncol=2)
@@ -494,10 +529,11 @@ def render_bev(
                           alpha=0.75, linewidth=0.8),
             )
 
-    # Target marker — gold star
-    tx, ty = float(query.target_xyz[0]), float(query.target_xyz[1])
-    ax.plot(tx, ty, marker="*", color="#FFD700", markersize=16,
-            markeredgecolor="black", markeredgewidth=0.8, zorder=5)
+    # Target marker — gold star (only when GT target is available)
+    if show_target:
+        tx, ty = float(query.target_xyz[0]), float(query.target_xyz[1])
+        ax.plot(tx, ty, marker="*", color="#FFD700", markersize=16,
+                markeredgecolor="black", markeredgewidth=0.8, zorder=5)
 
     ax.set_xlabel("x (m)")
     ax.set_ylabel("y (m)")
@@ -519,6 +555,8 @@ def render_bev_with_sample_overlay(
     samples_xyz: np.ndarray,  # (K, 3) position samples in world frame
     resolution: float = 1, # voxel size in metres for the density overlay
     heatmap_alpha: float = 0.35,
+    highlight_object_ids: set[int] | None = None,
+    show_target: bool = True,
 ) -> plt.Figure:
     """Render the anchor-highlight BEV, then overlay a per-voxel sample-proportion grid.
 
@@ -542,7 +580,13 @@ def render_bev_with_sample_overlay(
     Returns:
         ``matplotlib.figure.Figure``
     """
-    fig = render_bev(query, anchor_highlight=True, include_legend=False)
+    fig = render_bev(
+        query,
+        anchor_highlight=highlight_object_ids is None,
+        highlight_object_ids=highlight_object_ids,
+        include_legend=False,
+        show_target=show_target,
+    )
     ax = fig.axes[0]
 
     x_min, x_max = ax.get_xlim()
@@ -568,7 +612,8 @@ def render_bev_with_sample_overlay(
     normalized = np.clip((log_prop - _LOG_MIN) / (_LOG_MAX - _LOG_MIN), 0.0, 1.0)
 
     rgba = plt.cm.plasma(normalized)             # (H, W, 4)
-    rgba[..., 3] = heatmap_alpha                 # uniform alpha — colour everywhere
+    # Transparent where proportion is below threshold; opaque elsewhere
+    rgba[..., 3] = np.where(proportion > 0, heatmap_alpha, 0.0)
 
     # ── Mask voxels outside all region bounding boxes ─────────────────────────
     # Use every region bbox in the scene graph (including regions excluded from
@@ -600,6 +645,93 @@ def render_bev_with_sample_overlay(
         interpolation="nearest",
         zorder=4,  # above BEV image, below gold star (zorder=5)
     )
+
+    fig.tight_layout()
+    return fig
+
+
+# ---------------------------------------------------------------------------
+# GMM overlay (for LanguageSpatialSensor pipeline output)
+# ---------------------------------------------------------------------------
+
+def render_bev_with_gmm_overlay(
+    query: SpatialQuery,
+    gmm_result,  # GMMResult — avoid circular import
+    n_samples: int = 5000,
+    resolution: float = 0.25,
+    heatmap_alpha: float = 0.35,
+    show_component_means: bool = True,
+    show_target: bool = False,
+    seed: int = 42,
+) -> plt.Figure:
+    """Render BEV with a GMM density overlay and optional component markers.
+
+    Samples from the GMM and overlays the density, similar to
+    ``render_bev_with_sample_overlay`` but also marks each Gaussian
+    component mean with its weight.
+
+    The BEV highlights the hypothesized anchor objects from the GMM groundings
+    (not GT anchor labels).  The GT target marker is hidden by default; pass
+    ``show_target=True`` to display it when ground truth is available.
+
+    Args:
+        query:                SpatialQuery with point cloud data for BEV.
+        gmm_result:          :class:`GMMResult` from LanguageSpatialSensor.predict().
+        n_samples:           Number of samples drawn from the GMM for density.
+        resolution:          Voxel size in metres for the density overlay.
+        heatmap_alpha:       Opacity of density overlay.
+        show_component_means: Mark each Gaussian component with a labelled dot.
+        show_target:         Show the GT target gold-star marker (default False).
+        seed:                Random seed for deterministic sampling.
+
+    Returns:
+        ``matplotlib.figure.Figure``
+    """
+    # Collect all hypothesized anchor object IDs from every grounding
+    anchor_ids: set[int] = set()
+    for g in gmm_result.groundings:
+        anchor_ids.update(g.anchor_object_ids)
+
+    samples_xyz = gmm_result.sample(n_samples, seed=seed)
+    fig = render_bev_with_sample_overlay(
+        query, samples_xyz,
+        resolution=resolution,
+        heatmap_alpha=heatmap_alpha,
+        highlight_object_ids=anchor_ids if anchor_ids else None,
+        show_target=show_target,
+    )
+    ax = fig.axes[0]
+
+    if show_component_means:
+        mus = gmm_result.mus.numpy()    # (K, 3)
+        weights = gmm_result.weights.numpy()  # (K,)
+        cmap = plt.cm.Set1
+        for k in range(len(weights)):
+            mx, my = float(mus[k, 0]), float(mus[k, 1])
+            w = weights[k]
+            color = cmap(k % cmap.N)
+            ax.plot(
+                mx, my, "o",
+                color=color,
+                markersize=8 + 12 * w,  # larger = higher weight
+                markeredgecolor="white",
+                markeredgewidth=1.2,
+                zorder=6,
+            )
+            ax.annotate(
+                f"w={w:.2f}",
+                (mx, my),
+                textcoords="offset points",
+                xytext=(6, 6),
+                fontsize=7,
+                color=color,
+                fontweight="bold",
+                zorder=7,
+                bbox=dict(
+                    boxstyle="round,pad=0.15", fc="white", ec=color,
+                    alpha=0.7, linewidth=0.6,
+                ),
+            )
 
     fig.tight_layout()
     return fig
