@@ -33,6 +33,7 @@ from typing import Any
 
 import numpy as np
 from tqdm import tqdm
+import torch
 
 from language_spatial_sensor.core.schema import SpatialQuery
 from language_spatial_sensor.core.transforms import build_spatial_query

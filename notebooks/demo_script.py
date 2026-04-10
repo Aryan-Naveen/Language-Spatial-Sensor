@@ -127,10 +127,19 @@ def run_benchmark(DATA_ROOT, CHECKPOINT):
         datasets=["Unity", "3RScan"],
         n=50,
     )
-
+    LSS_ROOT = setup_paths()
+    openai_proposer = LLMProposer(
+        provider="openai",
+        model="gpt-5.2",
+        cache_dir="cache/proposer",
+        verbose=True,
+    )
     approaches = {
         "gt_oracle": LanguageSpatialSensor(
-            CHECKPOINT, GroundTruthProposer()
+            CHECKPOINT, GroundTruthProposer(),
+            clip_label_map=str(
+                LSS_ROOT / "cache" / "clip_label_map.pt"
+            ),            
         ),
         "ollama_qwen": LanguageSpatialSensor(
             CHECKPOINT,
@@ -139,7 +148,17 @@ def run_benchmark(DATA_ROOT, CHECKPOINT):
                 model="qwen2.5:32b",
                 cache_dir="cache/proposer",
             ),
+            clip_label_map=str(
+                LSS_ROOT / "cache" / "clip_label_map.pt"
+            ),            
         ),
+        "openai": LanguageSpatialSensor(
+            CHECKPOINT,
+            openai_proposer,
+            clip_label_map=str(
+                LSS_ROOT / "cache" / "clip_label_map.pt"
+            ),            
+        ),        
     }
 
     results = run_benchmark(approaches, queries)
@@ -176,19 +195,19 @@ def main():
     DATA_ROOT = Path("/home/aryannav/mit/data/VLA-3D/VLA-3D_dataset")
     CHECKPOINT = LSS_ROOT / "checkpoints" / "best.pt"
 
-    scene, sg, points, obj_split = load_scene(DATA_ROOT)
-    sensor = init_sensor(LSS_ROOT, CHECKPOINT)
+    # scene, sg, points, obj_split = load_scene(DATA_ROOT)
+    # sensor = init_sensor(LSS_ROOT, CHECKPOINT)
 
-    result = run_query(sensor, scene, sg, points, obj_split)
+    # result = run_query(sensor, scene, sg, points, obj_split)
 
-    visualize(
-        scene,
-        sg,
-        points,
-        obj_split,
-        result,
-        "there is a lamp.",
-    )
+    # visualize(
+    #     scene,
+    #     sg,
+    #     points,
+    #     obj_split,
+    #     result,
+    #     "there is a lamp.",
+    # )
 
     run_benchmark(DATA_ROOT, CHECKPOINT)
 

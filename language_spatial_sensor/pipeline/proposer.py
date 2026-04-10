@@ -360,7 +360,6 @@ class LLMProposer(Proposer):
             {"role": "assistant", "content": _FS_ASST_2},
             {"role": "user", "content": user_msg},
         ]
-        print(messages)
         kwargs: dict[str, Any] = {
             "model": self._model,
             "messages": messages,
