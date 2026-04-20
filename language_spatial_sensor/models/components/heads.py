@@ -11,6 +11,7 @@ Current registrations:
 
 Loss functions are registered in LOSS_REGISTRY:
     "bbox_cdf"           — Gaussian box mass vs. uniform baseline + distance penalty
+    "center_nll"         — Multivariate Gaussian NLL + L1 + Mahalanobis + volume penalty
 
 Planned (not yet registered):
     "flow"               — normalising flow over 3-D space
@@ -259,6 +260,58 @@ def bbox_cdf_loss(
     dist_loss = ((mu - bbox_center) ** 2).sum(dim=-1)
 
     return (nll_loss + lambda_dist * dist_loss).mean()
+
+
+@LOSS_REGISTRY.register("center_nll")
+def center_nll_loss(
+    pred: GaussianPrediction,
+    target_xyz: torch.Tensor,        # (B, 3) object center in world frame
+    lambda_l1: float = 1.0,
+    lambda_mahal: float = 0.1,
+    lambda_vol: float = 0.01,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Multivariate Gaussian NLL on object centre with conformal-set auxiliary losses.
+
+    Components:
+        1. **Gaussian NLL** — standard negative log-likelihood under the predicted
+           multivariate normal :math:`\\mathcal{N}(\\mu, \\Sigma)` with
+           :math:`\\Sigma = L L^{\\mathsf T}`.
+        2. **L1 loss** — :math:`\\|\\mu - y\\|_1`, encourages accurate mean predictions.
+        3. **Mahalanobis penalty** — :math:`\\sqrt{(y-\\mu)^{\\mathsf T} \\Sigma^{-1} (y-\\mu)}`,
+           penalises large normalised errors for better-calibrated uncertainty.
+        4. **Covariance volume penalty** — :math:`\\log\\det\\Sigma`, encourages smaller
+           predicted confidence ellipsoids (tighter conformal sets).
+    """
+    mu = pred.mu                                                    # (B, 3)
+    L  = pred.L                                                     # (B, 3, 3)
+
+    diff = target_xyz - mu                                          # (B, 3)
+
+    # log det(Sigma) = 2 * sum(log(diag(L)))
+    log_diag = L.diagonal(dim1=-2, dim2=-1).clamp(min=eps).log()   # (B, 3)
+    log_det  = 2.0 * log_diag.sum(dim=-1)                          # (B,)
+
+    # Quadratic form via triangular solve: L z = diff  =>  z^T z = diff^T Sigma^{-1} diff
+    z    = torch.linalg.solve_triangular(
+        L, diff.unsqueeze(-1), upper=False,
+    ).squeeze(-1)                                                   # (B, 3)
+    quad = (z * z).sum(dim=-1)                                      # (B,)
+
+    # 1) Gaussian NLL
+    k   = mu.shape[-1]                                              # 3
+    nll = 0.5 * (log_det + quad + k * math.log(2.0 * math.pi))     # (B,)
+
+    # 2) L1 loss
+    l1 = diff.abs().sum(dim=-1)                                     # (B,)
+
+    # 3) Mahalanobis distance
+    mahal = quad.clamp(min=1e-12).sqrt()                            # (B,)
+
+    # 4) Covariance volume penalty (log_det already computed)
+
+    loss = nll + lambda_l1 * l1 + lambda_mahal * mahal + lambda_vol * log_det
+    return loss.mean()
 
 
 def marginal_cdf_at_gt(

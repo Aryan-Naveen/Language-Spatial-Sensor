@@ -24,6 +24,7 @@ WandB is enabled by default; disable with::
 
 from __future__ import annotations
 
+import math
 import random
 import sys
 from pathlib import Path
@@ -108,63 +109,141 @@ def build_optimizer(model: LSSModel, cfg: DictConfig):
     )
 
 
+def _compute_loss(tr, pred: GaussianPrediction, batch) -> torch.Tensor:
+    """Dispatch to the configured loss function."""
+    if tr.loss_type == "bbox_cdf":
+        return LOSS_REGISTRY.build(
+            "bbox_cdf",
+            pred,
+            batch.target_bbox_world,
+            batch.coord_scale,
+            lambda_dist=tr.bbox_cdf_lambda_dist,
+            eps=tr.bbox_cdf_eps,
+        )
+    elif tr.loss_type == "center_nll":
+        return LOSS_REGISTRY.build(
+            "center_nll",
+            pred,
+            batch.target_xyz_world,
+            lambda_l1=tr.center_nll_lambda_l1,
+            lambda_mahal=tr.center_nll_lambda_mahal,
+            lambda_vol=tr.center_nll_lambda_vol,
+        )
+    else:
+        raise ValueError(f"Unknown loss_type: {tr.loss_type}")
+
+
 @torch.no_grad()
 def evaluate(
     model: LSSModel,
     loader: DataLoader,
     device: torch.device,
     autocast_dtype: torch.dtype,
-    lambda_dist: float,
-    bbox_cdf_eps: float,
+    tr,
 ) -> dict[str, float]:
     """Run validation and return a dict of metrics."""
     model.eval()
     total_loss = 0.0
-    total_dist = 0.0
-    total_acc  = 0
-    total_gt_cdf_axis = 0.0
-    total_gt_cdf_prod = 0.0
     n = 0
+
+    # Collect per-sample metrics for percentile computation.
+    all_dist: list[torch.Tensor] = []
+    all_mahal: list[torch.Tensor] = []
+    all_inside: list[torch.Tensor] = []
+    all_gt_cdf_axis: list[torch.Tensor] = []
+    all_gt_cdf_prod: list[torch.Tensor] = []
+    # For conformal superset volumes.
+    all_log_det: list[torch.Tensor] = []
+    all_marginal_sigma: list[torch.Tensor] = []
+
+    conformal = getattr(tr, "conformal_superset", False)
 
     for batch in loader:
         batch = _to_device(batch, device)
         with torch.autocast(device_type=device.type, dtype=autocast_dtype):
             pred: GaussianPrediction = _forward(model, batch)
-            loss = LOSS_REGISTRY.build(
-                "bbox_cdf",
-                pred,
-                batch.target_bbox_world,
-                batch.coord_scale,
-                lambda_dist=lambda_dist,
-                eps=bbox_cdf_eps,
-            )
+            loss = _compute_loss(tr, pred, batch)
 
         B = pred.mu.shape[0]
         total_loss += loss.item() * B
+        n += B
 
         pred_f = GaussianPrediction(mu=pred.mu.float(), L=pred.L.float())
         axis_mass, mass_prod = marginal_cdf_at_gt(pred_f, batch.target_bbox_world.float())
-        total_gt_cdf_axis += axis_mass.sum().item()
-        total_gt_cdf_prod += mass_prod.sum().item()
 
-        mu_f   = pred.mu.float()
-        dist   = (mu_f - batch.target_xyz_world.float()).norm(dim=-1)
-        total_dist += dist.sum().item()
+        mu_f = pred_f.mu
+        target_f = batch.target_xyz_world.float()
+        diff = target_f - mu_f
+        dist = diff.norm(dim=-1)
 
-        bbox   = batch.target_bbox_world.float()
+        # Mahalanobis distance via triangular solve.
+        L_f = pred_f.L
+        z = torch.linalg.solve_triangular(
+            L_f, diff.unsqueeze(-1), upper=False,
+        ).squeeze(-1)
+        mahal = (z * z).sum(dim=-1).clamp(min=1e-12).sqrt()
+
+        bbox = batch.target_bbox_world.float()
         inside = (mu_f >= bbox[:, :3]).all(dim=-1) & (mu_f <= bbox[:, 3:]).all(dim=-1)
-        total_acc += inside.sum().item()
-        n += B
+
+        all_dist.append(dist.cpu())
+        all_mahal.append(mahal.cpu())
+        all_inside.append(inside.cpu())
+        all_gt_cdf_axis.append(axis_mass.cpu())
+        all_gt_cdf_prod.append(mass_prod.cpu())
+
+        if conformal:
+            log_det = 2.0 * L_f.diagonal(dim1=-2, dim2=-1).clamp(min=1e-6).log().sum(dim=-1)
+            marginal_var = (L_f ** 2).sum(dim=-1)              # (B, 3)
+            marginal_sigma = marginal_var.clamp(min=1e-12).sqrt()
+            all_log_det.append(log_det.cpu())
+            all_marginal_sigma.append(marginal_sigma.cpu())
 
     model.train()
+
+    # Concatenate per-sample tensors.
+    cat_dist     = torch.cat(all_dist)
+    cat_mahal    = torch.cat(all_mahal)
+    cat_inside   = torch.cat(all_inside).float()
+    cat_cdf_axis = torch.cat(all_gt_cdf_axis)
+    cat_cdf_prod = torch.cat(all_gt_cdf_prod)
+
     denom = max(n, 1)
-    return {
+    metrics: dict[str, float] = {
         "loss":                       total_loss / denom,
-        "mean_dist":                  total_dist / denom,
-        "acc":                        total_acc  / denom,
-        "gt_bbox_marginal_mass_mean": total_gt_cdf_axis / max(denom * 3, 1),
-        "gt_bbox_marginal_prod_mean": total_gt_cdf_prod / denom,
+        "mean_dist":                  cat_dist.mean().item(),
+        "dist_p90":                   cat_dist.quantile(0.9).item(),
+        "acc":                        cat_inside.mean().item(),
+        "mahal_mean":                 cat_mahal.mean().item(),
+        "mahal_p90":                  cat_mahal.quantile(0.9).item(),
+        "gt_bbox_marginal_mass_mean": cat_cdf_axis.mean().item(),
+        "gt_bbox_marginal_prod_mean": cat_cdf_prod.mean().item(),
+        "gt_bbox_marginal_prod_p90":  cat_cdf_prod.quantile(0.9).item(),
     }
+
+    if conformal:
+        cat_log_det = torch.cat(all_log_det)
+        cat_marginal_sigma = torch.cat(all_marginal_sigma)     # (N, 3)
+
+        coverage = getattr(tr, "conformal_coverage", 0.9)
+        q = cat_mahal.quantile(coverage).item()
+
+        # Conformal ellipsoid volume: V = (4/3) pi q^3 sqrt(det Sigma)
+        sqrt_det = (0.5 * cat_log_det).exp()
+        ellipsoid_vol = (4.0 / 3.0) * math.pi * (q ** 3) * sqrt_det
+
+        # AABB superset volume: V = prod_i(2 q sigma_i) = (2q)^3 prod(sigma_i)
+        superset_vol = ((2.0 * q) ** 3) * cat_marginal_sigma.prod(dim=-1)
+
+        metrics.update({
+            "conformal_q":                  q,
+            "conformal_ellipsoid_vol_mean": ellipsoid_vol.mean().item(),
+            "conformal_ellipsoid_vol_p90":  ellipsoid_vol.quantile(0.9).item(),
+            "conformal_superset_vol_mean":  superset_vol.mean().item(),
+            "conformal_superset_vol_p90":   superset_vol.quantile(0.9).item(),
+        })
+
+    return metrics
 
 
 def _to_device(batch, device: torch.device):
@@ -252,6 +331,7 @@ def generate_bev_plots(
     viz_seed: int,
     data_root: Path,
     datasets: list[str],
+    conformal_q: float | None = None,
 ) -> list[tuple[str, plt.Figure]]:
     """Run inference on N seeded val_seen scenes and return BEV + sample-density figures.
 
@@ -260,9 +340,14 @@ def generate_bev_plots(
     ``render_bev_with_sample_overlay`` as raw (K, 3) XYZ — swap this sampling call
     for a diffusion-transformer sampler and everything downstream is unchanged.
 
+    When ``conformal_q`` is provided, the Mahalanobis conformal ellipsoid at that
+    threshold is projected onto the X-Y plane and drawn on each BEV figure.
+
     Returns:
         List of (language_query, figure) pairs; scenes that fail to load are skipped.
     """
+    from matplotlib.patches import Ellipse as MplEllipse
+
     rng     = np.random.RandomState(viz_seed)
     indices = rng.choice(len(dataset), size=min(n_scenes, len(dataset)), replace=False)
 
@@ -293,6 +378,27 @@ def generate_bev_plots(
         samples_xyz = dist.sample((n_samples,)).cpu().numpy()  # (n_samples, 3)
 
         fig = render_bev_with_sample_overlay(query, samples_xyz=samples_xyz, resolution=0.25)
+
+        # Overlay conformal ellipsoid projected onto the X-Y plane.
+        if conformal_q is not None:
+            Sigma = (L @ L.T).cpu().numpy()                    # (3, 3)
+            Sigma_xy = Sigma[:2, :2]                           # marginal X-Y covariance
+            eigvals, eigvecs = np.linalg.eigh(Sigma_xy)
+            # Semi-axis lengths = q * sqrt(eigenvalue)
+            width  = 2.0 * conformal_q * np.sqrt(eigvals[1])  # major
+            height = 2.0 * conformal_q * np.sqrt(eigvals[0])  # minor
+            angle  = np.degrees(np.arctan2(eigvecs[1, 1], eigvecs[0, 1]))
+
+            mu_np = mu.cpu().numpy()
+            ax = fig.axes[0]
+            ellipse = MplEllipse(
+                xy=(mu_np[0], mu_np[1]),
+                width=width, height=height, angle=angle,
+                edgecolor="cyan", facecolor="none",
+                linewidth=1.5, linestyle="--", zorder=6,
+            )
+            ax.add_patch(ellipse)
+
         figs.append((sample.language, fig))
 
     model.train()
@@ -410,14 +516,7 @@ def run_training(cfg: DictConfig) -> float:
 
             with torch.autocast(device_type=device.type, dtype=autocast_dtype):
                 pred: GaussianPrediction = _forward(model, batch)
-                loss = LOSS_REGISTRY.build(
-                    "bbox_cdf",
-                    pred,
-                    batch.target_bbox_world,
-                    batch.coord_scale,
-                    lambda_dist=tr.bbox_cdf_lambda_dist,
-                    eps=tr.bbox_cdf_eps,
-                )
+                loss = _compute_loss(tr, pred, batch)
 
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -447,8 +546,7 @@ def run_training(cfg: DictConfig) -> float:
             eval_kwargs = dict(
                 device=device,
                 autocast_dtype=autocast_dtype,
-                lambda_dist=tr.bbox_cdf_lambda_dist,
-                bbox_cdf_eps=tr.bbox_cdf_eps,
+                tr=tr,
             )
 
             # val_seen
@@ -464,18 +562,28 @@ def run_training(cfg: DictConfig) -> float:
             seen_str = (
                 f"[epoch {epoch:3d}] train={avg_train_loss:.4f}  "
                 f"seen_loss={val_loss:.4f}  seen_acc={val_metrics['acc']:.3f}  "
-                f"seen_dist={val_metrics['mean_dist']:.3f}m  "
-                f"seen_mpm={val_metrics['gt_bbox_marginal_mass_mean']:.3f}  "
+                f"seen_dist={val_metrics['mean_dist']:.3f}m(p90={val_metrics['dist_p90']:.3f})  "
+                f"seen_mahal={val_metrics['mahal_mean']:.3f}(p90={val_metrics['mahal_p90']:.3f})  "
                 f"seen_prod={val_metrics['gt_bbox_marginal_prod_mean']:.4f}"
             )
             print(seen_str)
+            if "conformal_q" in val_metrics:
+                conf_str = (
+                    f"{'':>12}"
+                    f"conformal_q={val_metrics['conformal_q']:.3f}  "
+                    f"ellipsoid_vol={val_metrics['conformal_ellipsoid_vol_mean']:.3f}"
+                    f"(p90={val_metrics['conformal_ellipsoid_vol_p90']:.3f})  "
+                    f"superset_vol={val_metrics['conformal_superset_vol_mean']:.3f}"
+                    f"(p90={val_metrics['conformal_superset_vol_p90']:.3f})"
+                )
+                print(conf_str)
             if val_unseen_metrics is not None:
                 unseen_str = (
                     f"{'':>12}"
                     f"unseen_loss={val_unseen_metrics['loss']:.4f}  "
                     f"unseen_acc={val_unseen_metrics['acc']:.3f}  "
-                    f"unseen_dist={val_unseen_metrics['mean_dist']:.3f}m  "
-                    f"unseen_mpm={val_unseen_metrics['gt_bbox_marginal_mass_mean']:.3f}  "
+                    f"unseen_dist={val_unseen_metrics['mean_dist']:.3f}m(p90={val_unseen_metrics['dist_p90']:.3f})  "
+                    f"unseen_mahal={val_unseen_metrics['mahal_mean']:.3f}(p90={val_unseen_metrics['mahal_p90']:.3f})  "
                     f"unseen_prod={val_unseen_metrics['gt_bbox_marginal_prod_mean']:.4f}"
                 )
                 print(unseen_str)
@@ -483,22 +591,14 @@ def run_training(cfg: DictConfig) -> float:
             # ── W&B logging ─────────────────────────────────────────────────
             if use_wandb:
                 log_dict: dict = {
-                    "epoch":                epoch,
-                    "train/epoch_loss":     avg_train_loss,
-                    "val_seen/loss":        val_loss,
-                    "val_seen/acc":         val_metrics["acc"],
-                    "val_seen/mean_dist":   val_metrics["mean_dist"],
-                    "val_seen/gt_bbox_marginal_mass_mean": val_metrics["gt_bbox_marginal_mass_mean"],
-                    "val_seen/gt_bbox_marginal_prod_mean": val_metrics["gt_bbox_marginal_prod_mean"],
+                    "epoch":            epoch,
+                    "train/epoch_loss": avg_train_loss,
                 }
+                for k, v in val_metrics.items():
+                    log_dict[f"val_seen/{k}"] = v
                 if val_unseen_metrics is not None:
-                    log_dict.update({
-                        "val_unseen/loss":      val_unseen_metrics["loss"],
-                        "val_unseen/acc":       val_unseen_metrics["acc"],
-                        "val_unseen/mean_dist": val_unseen_metrics["mean_dist"],
-                        "val_unseen/gt_bbox_marginal_mass_mean": val_unseen_metrics["gt_bbox_marginal_mass_mean"],
-                        "val_unseen/gt_bbox_marginal_prod_mean": val_unseen_metrics["gt_bbox_marginal_prod_mean"],
-                    })
+                    for k, v in val_unseen_metrics.items():
+                        log_dict[f"val_unseen/{k}"] = v
                 wandb.log(log_dict)
 
             # ── BEV visualisation (val_seen only) ───────────────────────────
@@ -510,6 +610,7 @@ def run_training(cfg: DictConfig) -> float:
                     viz_seed=cfg.viz.seed,
                     data_root=Path(cfg.data.data_root),
                     datasets=list(cfg.data.datasets),
+                    conformal_q=val_metrics.get("conformal_q"),
                 )
                 if use_wandb:
                     wandb.log({

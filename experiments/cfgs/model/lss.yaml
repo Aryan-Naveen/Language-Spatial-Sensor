@@ -8,7 +8,7 @@ bert_dim: 768
 
 # ── Text encoder ──────────────────────────────────────────────────────────────
 text_model: bert-base-uncased
-freeze_text: false        # fine-tune BERT; set true to freeze for faster runs
+freeze_text: true        # fine-tune BERT; set true to freeze for faster runs
 
 # ── Spatial relation MLP ──────────────────────────────────────────────────────
 spatial_relation_dim: 12  # mlp: 6+6 concat; center/vertical_bottom: 1, 4, or 5
@@ -30,7 +30,7 @@ pooling_type: mean        # {mean, max, attention}
 
 # ── Output head ───────────────────────────────────────────────────────────────
 # gaussian_cholesky | gaussian_diagonal
-head_type: gaussian_diagonal
+head_type: gaussian_cholesky
 # gaussian_diagonal only (safe defaults for cholesky head — unused)
 head_hidden_sizes: [1024, 512]
 head_dropout: 0.15
