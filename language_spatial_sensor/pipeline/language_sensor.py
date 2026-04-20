@@ -198,17 +198,21 @@ class LanguageSpatialSensor:
         object_split: np.ndarray | None = None,
         target_xyz: np.ndarray | None = None,
         target_bbox: np.ndarray | None = None,
+        gt_anchor_object_ids: list[int] | None = None,
+        gt_anchor_room_id: int | None = None,
     ) -> GMMResult:
         """Run the full pipeline: proposer -> model -> GMM.
 
         Args:
-            scene_graph:  Scene context (objects + regions).
-            utterance:    Natural-language placement description.
-            scene_id:     Optional scene identifier (used for caching).
-            pc:           Point cloud (only needed for GroundTruthProposer eval).
-            object_split: Per-point object IDs (only needed for GT eval).
-            target_xyz:   GT target position (only for evaluation).
-            target_bbox:  GT target AABB (only for evaluation).
+            scene_graph:          Scene context (objects + regions).
+            utterance:            Natural-language placement description.
+            scene_id:             Optional scene identifier (used for caching).
+            pc:                   Point cloud (only needed for GroundTruthProposer eval).
+            object_split:         Per-point object IDs (only needed for GT eval).
+            target_xyz:           GT target position (only for evaluation).
+            target_bbox:          GT target AABB (only for evaluation).
+            gt_anchor_object_ids: GT anchor object IDs (only for GroundTruthProposer).
+            gt_anchor_room_id:    GT anchor room ID (only for GroundTruthProposer).
 
         Returns:
             :class:`GMMResult` with K Gaussian components weighted by proposer confidence.
@@ -224,6 +228,8 @@ class LanguageSpatialSensor:
             language=utterance,
             target_xyz=target_xyz if target_xyz is not None else np.zeros(3, dtype=np.float32),
             target_bbox=target_bbox,
+            gt_anchor_object_ids=gt_anchor_object_ids,
+            gt_anchor_room_id=gt_anchor_room_id,
         )
 
         # -- proposer --

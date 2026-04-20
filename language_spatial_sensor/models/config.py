@@ -30,6 +30,14 @@ class LSSConfig:
     spatial_mlp_hidden: int = 64     # hidden dim of the relation projection MLP
     pairwise_rel_type: str = "mlp"  # "mlp" | "center" | "vertical_bottom"
     spatial_pairwise_dist_norm: bool = True  # ignored when pairwise_rel_type == "mlp"
+    # Language-conditioned spatial bias: FiLM the spatial-MLP hidden layer with text CLS.
+    # Lets the pairwise bias depend on the query (e.g. "above" up-weights vertical pairs).
+    condition_spatial_on_text: bool = False
+
+    # ── Anchor-centric object embedding ──────────────────────────────────────
+    # Inject per-object (centre − anchor-centroid) delta as an additive hidden embedding.
+    # Encourages the model to reason in relative coordinates w.r.t. referenced anchors.
+    use_anchor_centric_coords: bool = False
 
     # ── Backbone (3D-SceneSpatial encoder) ───────────────────────────────────
     backbone_type: str = "scene_spatial"     # key into BACKBONE_REGISTRY
@@ -41,7 +49,10 @@ class LSSConfig:
     ffn_dim: int = 1024              # feed-forward dim in all transformer layers
 
     # ── Pooling ───────────────────────────────────────────────────────────────
-    pooling_type: str = "mean"       # key into POOLING_REGISTRY
+    # "mean" | "max" | "attention" | "query_token"
+    # query_token: DETR-style learnable [Q_target] token prepended to the fusion
+    # sequence; its post-fusion state is used as the context vector.
+    pooling_type: str = "mean"
 
     # ── Output head ───────────────────────────────────────────────────────────
     head_type: str = "gaussian_cholesky"   # key into HEAD_REGISTRY

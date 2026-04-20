@@ -1,0 +1,29 @@
+# Installed automatically by SageMaker (SourceCode.requirements) on top of the
+# PyTorch 2.4.0 + Python 3.11 DLC, before train_lss_sagemaker.py runs.
+#
+# torch / torchvision come from the DLC base image.
+
+# --- Core deep learning stack (already in DLC, pin upgrades) ---
+transformers>=4.40.0
+huggingface-hub>=0.24.0
+tokenizers
+
+# --- Config management ---
+hydra-core>=1.3.2
+omegaconf>=2.3.0
+# Optuna sweeper plugin (+ Optuna itself)
+hydra-optuna-sweeper>=1.2.0
+optuna>=3.4.0
+
+# --- Numerics / geometry ---
+numpy>=1.24.0
+scipy>=1.12.0
+einops>=0.7.0
+pillow
+tqdm>=4.65.0
+matplotlib
+
+# --- Misc runtime ---
+typing-extensions
+rich>=13.0.0
+termcolor>=2.4.0

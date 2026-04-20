@@ -158,18 +158,24 @@ def _group_metric(
     values: list[float],
     groups: list,
 ) -> dict[Any, dict[str, float]]:
-    """Group values and compute mean/std/count per group."""
+    """Group values and compute mean/std/median/IQR/count per group."""
     by_group: dict[Any, list[float]] = defaultdict(list)
     for v, g in zip(values, groups):
         by_group[g].append(v)
-    return {
-        g: {
-            "mean": float(np.mean(vs)),
-            "std": float(np.std(vs)),
+    out: dict[Any, dict[str, float]] = {}
+    for g, vs in sorted(by_group.items(), key=lambda x: str(x[0])):
+        arr = np.asarray(vs, dtype=np.float64)
+        q25, q75 = np.percentile(arr, [25, 75])
+        out[g] = {
+            "mean": float(arr.mean()),
+            "std": float(arr.std()),
+            "median": float(np.median(arr)),
+            "q25": float(q25),
+            "q75": float(q75),
+            "iqr": float(q75 - q25),
             "count": len(vs),
         }
-        for g, vs in sorted(by_group.items(), key=lambda x: str(x[0]))
-    }
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -210,12 +216,17 @@ def compute_all_metrics(
     relations = [q.metadata.get("relation", "unknown") for q in queries]
     ambiguities = [q.metadata.get("ambiguity", 0) for q in queries]
 
+    nll_q25, nll_q75 = np.percentile(nlls, [25, 75]) if nlls else (0.0, 0.0)
     overall = {
         "cdf_mean": float(np.mean(cdfs)),
         "cdf_median": float(np.median(cdfs)),
         "rmse_mean": float(np.mean(rmses)),
         "rmse_median": float(np.median(rmses)),
         "nll_mean": float(np.mean(nlls)),
+        "nll_median": float(np.median(nlls)) if nlls else 0.0,
+        "nll_q25": float(nll_q25),
+        "nll_q75": float(nll_q75),
+        "nll_iqr": float(nll_q75 - nll_q25),
         "accuracy": float(np.mean(in_bbox)),
         "ece": ece,
         "n": len(queries),
@@ -223,6 +234,11 @@ def compute_all_metrics(
 
     return {
         "overall": overall,
+        "per_query": {
+            "cdf": list(cdfs),
+            "rmse": list(rmses),
+            "nll": list(nlls),
+        },
         "by_relation": {
             metric: _group_metric(vals, relations)
             for metric, vals in [("cdf", cdfs), ("rmse", rmses), ("nll", nlls)]

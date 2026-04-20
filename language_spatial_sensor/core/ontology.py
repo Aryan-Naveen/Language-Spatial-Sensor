@@ -62,7 +62,7 @@ VALID_NYU40_LABELS: frozenset[str] = frozenset({
     "lamp",
     "bathtub",
     "bag",
-    "otherprop",
-    "otherfurniture",
-    "otherstructure",
+    # "otherprop",
+    # "otherfurniture",
+    # "otherstructure",
 })

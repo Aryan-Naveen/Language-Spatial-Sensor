@@ -33,7 +33,12 @@ import torch
 import torch.nn as nn
 
 from .config import LSSConfig
-from .components.encoders import SpatialRelationMLP, TextEncoder, VisionEncoder
+from .components.encoders import (
+    AnchorCentricEmbedding,
+    SpatialRelationMLP,
+    TextEncoder,
+    VisionEncoder,
+)
 from .components.heads import FiLMLayer
 from .registry import BACKBONE_REGISTRY, HEAD_REGISTRY, POOLING_REGISTRY
 
@@ -104,6 +109,9 @@ class LSSModel(nn.Module):
         self.text_enc    = TextEncoder(cfg)
         self.vision_enc  = VisionEncoder(cfg)
         self.spatial_enc = SpatialRelationMLP(cfg)
+        self.anchor_centric: AnchorCentricEmbedding | None = (
+            AnchorCentricEmbedding(cfg) if cfg.use_anchor_centric_coords else None
+        )
 
         # ── Backbone: object feature spatial refinement ────────────────────────
         self.backbone = BACKBONE_REGISTRY.build(cfg.backbone_type, cfg)
@@ -142,8 +150,14 @@ class LSSModel(nn.Module):
         # ── 2. Encode vision + add role / modality tags ────────────────────────
         obj_feat_vis = self.vision_enc(obj_clip_features, obj_is_anchor)  # (B, N, D)
 
-        # ── 3. Compute pairwise spatial relations ──────────────────────────────
-        spatial_rel = self.spatial_enc(obj_bboxes)                      # (B, N, N, R)
+        # ── 2b. Anchor-centric position embedding (optional) ──────────────────
+        if self.anchor_centric is not None:
+            obj_feat_vis = self.anchor_centric(
+                obj_feat_vis, obj_bboxes, obj_is_anchor, obj_padding_mask
+            )
+
+        # ── 3. Compute pairwise spatial relations (optionally text-conditioned) ─
+        spatial_rel = self.spatial_enc(obj_bboxes, text_cls)            # (B, N, N, R)
 
         # ── 4. Spatial refinement backbone (e.g. ViSTA) ───────────────────────
         obj_feat = self.backbone(obj_feat_vis, spatial_rel, obj_padding_mask)  # (B, N, D)
@@ -158,8 +172,15 @@ class LSSModel(nn.Module):
         text_valid   = torch.zeros(B, 1, dtype=torch.bool, device=seq.device)
         fusion_mask  = torch.cat([text_valid, obj_padding_mask], dim=1)  # (B, 1+N)
 
+        # ── 5b. Inject target-query token (pooling_type="query_token") ────────
+        # Sequence becomes [text_CLS, Q_target, obj_1, …, obj_N]; the query
+        # cross-attends to text + objects during fusion and its post-fusion state
+        # replaces the usual pooled vector.
+        if hasattr(self.pool, "prepend"):
+            seq, fusion_mask = self.pool.prepend(seq, fusion_mask)
+
         # ── 6. Global fusion ───────────────────────────────────────────────────
-        seq = self.fusion(seq, fusion_mask)                             # (B, 1+N, D)
+        seq = self.fusion(seq, fusion_mask)                             # (B, S, D)
 
         # ── 7. Pool → scene-text context vector ───────────────────────────────
         ctx_pool = self.pool(seq, fusion_mask)                          # (B, D)

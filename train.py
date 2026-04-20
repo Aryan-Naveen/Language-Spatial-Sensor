@@ -149,11 +149,14 @@ def evaluate(
     # Collect per-sample metrics for percentile computation.
     all_dist: list[torch.Tensor] = []
     all_mahal: list[torch.Tensor] = []
+    all_nll: list[torch.Tensor] = []
+    all_quad: list[torch.Tensor] = []      # diffᵀ Σ⁻¹ diff  (Mahalanobis²)
+    all_log_det: list[torch.Tensor] = []   # log|Σ|           (variance volume)
+    all_min_sigma: list[torch.Tensor] = [] # min(diag(L))     (variance collapse proxy)
     all_inside: list[torch.Tensor] = []
     all_gt_cdf_axis: list[torch.Tensor] = []
     all_gt_cdf_prod: list[torch.Tensor] = []
     # For conformal superset volumes.
-    all_log_det: list[torch.Tensor] = []
     all_marginal_sigma: list[torch.Tensor] = []
 
     conformal = getattr(tr, "conformal_superset", False)
@@ -181,32 +184,51 @@ def evaluate(
         z = torch.linalg.solve_triangular(
             L_f, diff.unsqueeze(-1), upper=False,
         ).squeeze(-1)
-        mahal = (z * z).sum(dim=-1).clamp(min=1e-12).sqrt()
+        quad  = (z * z).sum(dim=-1).clamp(min=1e-12)        # (B,) = diffᵀΣ⁻¹diff
+        mahal = quad.sqrt()
+
+        # Multivariate Gaussian NLL at GT target centre (matches gmm_nll_at_gt):
+        #   -log N(y; μ, Σ) = 0.5 (log|Σ| + (y-μ)ᵀ Σ⁻¹ (y-μ) + k log 2π),  k=3
+        log_det = 2.0 * L_f.diagonal(dim1=-2, dim2=-1).clamp(min=1e-6).log().sum(dim=-1)
+        nll     = 0.5 * (log_det + quad + 3.0 * math.log(2.0 * math.pi))
 
         bbox = batch.target_bbox_world.float()
         inside = (mu_f >= bbox[:, :3]).all(dim=-1) & (mu_f <= bbox[:, 3:]).all(dim=-1)
 
+        # Per-sample diag of L (region-frame σ lower bound) → flags variance collapse.
+        L_diag    = L_f.diagonal(dim1=-2, dim2=-1).clamp(min=1e-12)   # (B, 3)
+        min_sigma = L_diag.min(dim=-1).values                         # (B,)
+
         all_dist.append(dist.cpu())
         all_mahal.append(mahal.cpu())
+        all_nll.append(nll.cpu())
+        all_quad.append(quad.cpu())
+        all_log_det.append(log_det.cpu())
+        all_min_sigma.append(min_sigma.cpu())
         all_inside.append(inside.cpu())
         all_gt_cdf_axis.append(axis_mass.cpu())
         all_gt_cdf_prod.append(mass_prod.cpu())
 
         if conformal:
-            log_det = 2.0 * L_f.diagonal(dim1=-2, dim2=-1).clamp(min=1e-6).log().sum(dim=-1)
             marginal_var = (L_f ** 2).sum(dim=-1)              # (B, 3)
             marginal_sigma = marginal_var.clamp(min=1e-12).sqrt()
-            all_log_det.append(log_det.cpu())
             all_marginal_sigma.append(marginal_sigma.cpu())
 
     model.train()
 
     # Concatenate per-sample tensors.
-    cat_dist     = torch.cat(all_dist)
-    cat_mahal    = torch.cat(all_mahal)
-    cat_inside   = torch.cat(all_inside).float()
-    cat_cdf_axis = torch.cat(all_gt_cdf_axis)
-    cat_cdf_prod = torch.cat(all_gt_cdf_prod)
+    cat_dist      = torch.cat(all_dist)
+    cat_mahal     = torch.cat(all_mahal)
+    cat_nll       = torch.cat(all_nll)
+    cat_quad      = torch.cat(all_quad)
+    cat_log_det   = torch.cat(all_log_det)
+    cat_min_sigma = torch.cat(all_min_sigma)
+    cat_inside    = torch.cat(all_inside).float()
+    cat_cdf_axis  = torch.cat(all_gt_cdf_axis)
+    cat_cdf_prod  = torch.cat(all_gt_cdf_prod)
+
+    def _iqr(t: torch.Tensor) -> float:
+        return (t.quantile(0.75) - t.quantile(0.25)).item()
 
     denom = max(n, 1)
     metrics: dict[str, float] = {
@@ -216,13 +238,27 @@ def evaluate(
         "acc":                        cat_inside.mean().item(),
         "mahal_mean":                 cat_mahal.mean().item(),
         "mahal_p90":                  cat_mahal.quantile(0.9).item(),
+        # ── NLL and its two additive components (log|Σ| + quad; constant 3·log2π omitted).
+        # Compare nll_iqr vs log_det_iqr vs quad_iqr to see which term dominates the spread.
+        "nll_mean":                   cat_nll.mean().item(),
+        "nll_median":                 cat_nll.median().item(),
+        "nll_iqr":                    _iqr(cat_nll),
+        "nll_p90":                    cat_nll.quantile(0.9).item(),
+        "quad_mean":                  cat_quad.mean().item(),
+        "quad_iqr":                   _iqr(cat_quad),
+        "quad_p90":                   cat_quad.quantile(0.9).item(),
+        "log_det_mean":               cat_log_det.mean().item(),
+        "log_det_iqr":                _iqr(cat_log_det),
+        "log_det_p10":                cat_log_det.quantile(0.1).item(),  # most collapsed Σ
+        # Per-sample min σ across axes — tracks variance collapse directly.
+        "min_sigma_mean":             cat_min_sigma.mean().item(),
+        "min_sigma_p10":              cat_min_sigma.quantile(0.1).item(),
         "gt_bbox_marginal_mass_mean": cat_cdf_axis.mean().item(),
         "gt_bbox_marginal_prod_mean": cat_cdf_prod.mean().item(),
         "gt_bbox_marginal_prod_p90":  cat_cdf_prod.quantile(0.9).item(),
     }
 
     if conformal:
-        cat_log_det = torch.cat(all_log_det)
         cat_marginal_sigma = torch.cat(all_marginal_sigma)     # (N, 3)
 
         coverage = getattr(tr, "conformal_coverage", 0.9)
@@ -407,8 +443,13 @@ def generate_bev_plots(
 
 # ── Training loop ─────────────────────────────────────────────────────────────
 
-def run_training(cfg: DictConfig) -> float:
-    """Train the model and return the best val_seen loss (for Optuna)."""
+def run_training(cfg: DictConfig, trial=None) -> float:
+    """Train the model and return the best val_seen loss (for Optuna).
+
+    If ``trial`` is provided (an ``optuna.Trial``), intermediate ``val_loss`` is
+    reported after every validation epoch via ``trial.report`` and the trial is
+    pruned if the sampler's pruner requests it (raises ``optuna.TrialPruned``).
+    """
     tr = cfg.training
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     autocast_dtype = _resolve_precision(tr.precision)
@@ -533,10 +574,14 @@ def run_training(cfg: DictConfig) -> float:
             pbar.set_postfix(loss=f"{loss_val:.4f}")
 
             if use_wandb and global_step % 50 == 0:
+                # param group 0 = BERT (lr = base * bert_lr_scale), group 1 = rest.
+                # Log the main-branch lr so freezing BERT (scale=0) doesn't zero the plot.
+                last_lrs = scheduler.get_last_lr()
                 wandb.log({
-                    "train/loss": loss_val,
-                    "train/lr":   scheduler.get_last_lr()[0],
-                    "step":       global_step,
+                    "train/loss":    loss_val,
+                    "train/lr":      last_lrs[1],
+                    "train/lr_bert": last_lrs[0],
+                    "step":          global_step,
                 })
 
         avg_train_loss = epoch_loss / max(len(train_loader), 1)
@@ -564,9 +609,17 @@ def run_training(cfg: DictConfig) -> float:
                 f"seen_loss={val_loss:.4f}  seen_acc={val_metrics['acc']:.3f}  "
                 f"seen_dist={val_metrics['mean_dist']:.3f}m(p90={val_metrics['dist_p90']:.3f})  "
                 f"seen_mahal={val_metrics['mahal_mean']:.3f}(p90={val_metrics['mahal_p90']:.3f})  "
+                f"seen_nll={val_metrics['nll_mean']:.2f}(iqr={val_metrics['nll_iqr']:.2f})  "
                 f"seen_prod={val_metrics['gt_bbox_marginal_prod_mean']:.4f}"
             )
+            diag_str = (
+                f"{'':>12}"
+                f"seen_quad={val_metrics['quad_mean']:.2f}(iqr={val_metrics['quad_iqr']:.2f}, p90={val_metrics['quad_p90']:.2f})  "
+                f"seen_logdet={val_metrics['log_det_mean']:.2f}(iqr={val_metrics['log_det_iqr']:.2f}, p10={val_metrics['log_det_p10']:.2f})  "
+                f"seen_minσ={val_metrics['min_sigma_mean']:.3f}(p10={val_metrics['min_sigma_p10']:.3f})"
+            )
             print(seen_str)
+            print(diag_str)
             if "conformal_q" in val_metrics:
                 conf_str = (
                     f"{'':>12}"
@@ -584,6 +637,7 @@ def run_training(cfg: DictConfig) -> float:
                     f"unseen_acc={val_unseen_metrics['acc']:.3f}  "
                     f"unseen_dist={val_unseen_metrics['mean_dist']:.3f}m(p90={val_unseen_metrics['dist_p90']:.3f})  "
                     f"unseen_mahal={val_unseen_metrics['mahal_mean']:.3f}(p90={val_unseen_metrics['mahal_p90']:.3f})  "
+                    f"unseen_nll={val_unseen_metrics['nll_mean']:.2f}(iqr={val_unseen_metrics['nll_iqr']:.2f})  "
                     f"unseen_prod={val_unseen_metrics['gt_bbox_marginal_prod_mean']:.4f}"
                 )
                 print(unseen_str)
@@ -633,6 +687,18 @@ def run_training(cfg: DictConfig) -> float:
                     },
                     ckpt_dir / "best.pt",
                 )
+
+            # Optuna: persist intermediate value + honour the pruner.
+            # Done after save so a pruned trial still has its best checkpoint.
+            if trial is not None:
+                import optuna
+                trial.report(val_loss, step=epoch)
+                if trial.should_prune():
+                    if use_wandb:
+                        wandb.finish()
+                    raise optuna.TrialPruned(
+                        f"Pruned at epoch {epoch} (val_loss={val_loss:.4f})"
+                    )
 
         # Periodic checkpoint
         if epoch % cfg.checkpoint.save_every == 0:

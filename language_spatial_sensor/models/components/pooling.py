@@ -55,6 +55,49 @@ class MaxPooling(nn.Module):
         return x.max(dim=1).values
 
 
+@POOLING_REGISTRY.register("query_token")
+class QueryTokenPooling(nn.Module):
+    """DETR-style target query token.
+
+    Owns a learnable query vector Q_target ∈ R^D.  LSSModel detects this pooler
+    (via ``hasattr(pool, "prepend")``) and inserts the query immediately after
+    the text CLS before the fusion transformer, so the token cross-attends to
+    both text and objects during fusion.  Its post-fusion state is extracted as
+    the pooled context vector — replacing the "average the scene" inductive
+    bias with a "what does the unobserved target attend to" signal.
+
+    Sequence layout when active:  [text_CLS, Q_target, obj_1, …, obj_N]
+    """
+
+    def __init__(self, cfg: LSSConfig) -> None:
+        super().__init__()
+        self.query = nn.Parameter(torch.empty(cfg.hidden_dim))
+        nn.init.normal_(self.query, std=cfg.hidden_dim ** -0.5)
+
+    def prepend(
+        self,
+        seq: torch.Tensor,           # (B, 1+N, D)  [text_CLS, obj_1, …, obj_N]
+        padding_mask: torch.Tensor,  # (B, 1+N)
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Insert Q_target at position 1; return extended (seq, mask)."""
+        B = seq.size(0)
+        q = self.query.to(seq.dtype).view(1, 1, -1).expand(B, 1, -1)  # (B, 1, D)
+        new_seq = torch.cat([seq[:, :1], q, seq[:, 1:]], dim=1)        # (B, 2+N, D)
+        q_mask = torch.zeros(B, 1, dtype=torch.bool, device=seq.device)
+        new_mask = torch.cat(
+            [padding_mask[:, :1], q_mask, padding_mask[:, 1:]], dim=1
+        )                                                              # (B, 2+N)
+        return new_seq, new_mask
+
+    def forward(
+        self,
+        x: torch.Tensor,                           # (B, 2+N, D)  post-fusion
+        padding_mask: torch.Tensor | None = None,  # unused
+    ) -> torch.Tensor:                             # (B, D)
+        # Position 1 is the Q_target slot (position 0 is text CLS).
+        return x[:, 1]
+
+
 @POOLING_REGISTRY.register("attention")
 class AttentionPooling(nn.Module):
     """Learned query vector attends over the full sequence.

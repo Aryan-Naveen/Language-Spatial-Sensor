@@ -8,7 +8,11 @@ from evaluation.metrics import (
     gmm_rmse,
     proposer_precision_recall,
 )
-from evaluation.benchmark import run_benchmark, load_eval_queries
+from evaluation.benchmark import (
+    load_eval_queries,
+    plot_cdf_histogram,
+    run_benchmark,
+)
 
 __all__ = [
     "compute_all_metrics",
@@ -19,4 +23,5 @@ __all__ = [
     "proposer_precision_recall",
     "run_benchmark",
     "load_eval_queries",
+    "plot_cdf_histogram",
 ]

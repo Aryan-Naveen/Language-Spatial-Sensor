@@ -176,18 +176,34 @@ class SpatialRelationMLP(nn.Module):
 
     Raw pairwise features (dim ``cfg.spatial_relation_dim``) are projected through
     a small MLP before use as spatial bias in ``MultiHeadAttentionSpatial``.
+
+    When ``cfg.condition_spatial_on_text`` is True, the hidden layer of the MLP is
+    FiLM-conditioned on the text CLS embedding.  The FiLM generator is initialised
+    so that γ ≈ 1 and β ≈ 0, making the conditioning a near-identity at start and
+    letting gradients learn how the query should reshape the pairwise bias (e.g.
+    up-weight vertical pairs when the text contains "above").
     """
 
     def __init__(self, cfg: LSSConfig) -> None:
         super().__init__()
         self.cfg = cfg
-        self.mlp = nn.Sequential(
-            nn.Linear(cfg.spatial_relation_dim, cfg.spatial_mlp_hidden),
-            nn.ReLU(),
-            nn.Linear(cfg.spatial_mlp_hidden, cfg.spatial_relation_dim),
-        )
+        self.fc1 = nn.Linear(cfg.spatial_relation_dim, cfg.spatial_mlp_hidden)
+        self.fc2 = nn.Linear(cfg.spatial_mlp_hidden, cfg.spatial_relation_dim)
 
-    def forward(self, bboxes: torch.Tensor) -> torch.Tensor:
+        self.text_film: nn.Linear | None = None
+        if cfg.condition_spatial_on_text:
+            self.text_film = nn.Linear(cfg.hidden_dim, 2 * cfg.spatial_mlp_hidden)
+            with torch.no_grad():
+                nn.init.zeros_(self.text_film.weight)
+                bias = torch.zeros(2 * cfg.spatial_mlp_hidden)
+                bias[: cfg.spatial_mlp_hidden] = 1.0
+                self.text_film.bias.copy_(bias)
+
+    def forward(
+        self,
+        bboxes: torch.Tensor,                # (B, N, 6)
+        text_cls: torch.Tensor | None = None,  # (B, D)  required when condition_spatial_on_text
+    ) -> torch.Tensor:                        # (B, N, N, R)
         raw = calc_pairwise_locs(
             bboxes,
             eps=1e-10,
@@ -195,4 +211,54 @@ class SpatialRelationMLP(nn.Module):
             spatial_dist_norm=self.cfg.spatial_pairwise_dist_norm,
             spatial_dim=self.cfg.spatial_relation_dim,
         )
-        return self.mlp(raw)
+        h = F.relu(self.fc1(raw))             # (B, N, N, H)
+
+        if self.text_film is not None:
+            if text_cls is None:
+                raise ValueError(
+                    "SpatialRelationMLP: condition_spatial_on_text=True but text_cls is None"
+                )
+            film = self.text_film(text_cls)   # (B, 2H)
+            H = self.cfg.spatial_mlp_hidden
+            gamma = film[:, :H].unsqueeze(1).unsqueeze(1)  # (B, 1, 1, H)
+            beta  = film[:, H:].unsqueeze(1).unsqueeze(1)  # (B, 1, 1, H)
+            h = gamma * h + beta
+
+        return self.fc2(h)
+
+
+# ── Anchor-centric object embedding ──────────────────────────────────────────
+
+class AnchorCentricEmbedding(nn.Module):
+    """Add a per-object (centre − anchor-centroid) embedding to obj features.
+
+    Forces the encoder to reason about relative offsets to the referenced
+    anchor(s) rather than absolute region-frame coordinates, improving
+    generalisation across room layouts.
+
+    Anchor centroid = mean of centres over anchor-tagged (non-padded) objects.
+    If no anchor is present, the centroid falls back to the origin.
+    """
+
+    def __init__(self, cfg: LSSConfig) -> None:
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(3, cfg.hidden_dim),
+            nn.GELU(),
+            nn.Linear(cfg.hidden_dim, cfg.hidden_dim),
+        )
+
+    def forward(
+        self,
+        obj_feat: torch.Tensor,       # (B, N, D)
+        bboxes: torch.Tensor,         # (B, N, 6)
+        is_anchor: torch.Tensor,      # (B, N)
+        padding_mask: torch.Tensor,   # (B, N)
+    ) -> torch.Tensor:                # (B, N, D)
+        centers = bboxes[..., :3]                                  # (B, N, 3)
+        anchor_mask = is_anchor.bool() & ~padding_mask.bool()      # (B, N)
+        w = anchor_mask.to(centers.dtype).unsqueeze(-1)            # (B, N, 1)
+        denom = w.sum(dim=1).clamp(min=1.0)                        # (B, 1)
+        centroid = (centers * w).sum(dim=1) / denom                # (B, 3)
+        delta = centers - centroid.unsqueeze(1)                    # (B, N, 3)
+        return obj_feat + self.mlp(delta)

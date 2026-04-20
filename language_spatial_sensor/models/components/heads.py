@@ -118,6 +118,10 @@ class GaussianCholeskyHead(nn.Module):
             nn.Dropout(cfg.dropout),
             nn.Linear(cfg.hidden_dim // 2, 9),  # 3 (mu) + 6 (L entries)
         )
+        # σ floor in region frame: prevents variance collapse → caps the 1/σ²
+        # blowup that creates the NLL right-tail on bad-confident samples.
+        # At least 1e-4 for numerical stability even when the user sets 0.
+        self.min_sigma: float = max(float(cfg.head_min_sigma), 1e-4)
         # lower-triangular index pairs (row, col) for a 3×3 matrix
         self.register_buffer(
             "tril_idx",
@@ -144,9 +148,10 @@ class GaussianCholeskyHead(nn.Module):
         diag_mask  = rows == cols
         off_mask   = ~diag_mask
 
-        # softplus(·) + ε ensures diagonal stays strictly positive
+        # softplus(·) + min_sigma keeps the diagonal strictly positive and
+        # (optionally) floored to prevent variance collapse on hard samples.
         L_region[:, rows[diag_mask], cols[diag_mask]] = (
-            F.softplus(l_raw[:, diag_mask]).to(L_region.dtype) + 1e-4
+            F.softplus(l_raw[:, diag_mask]).to(L_region.dtype) + self.min_sigma
         )
         L_region[:, rows[off_mask], cols[off_mask]] = l_raw[:, off_mask]
 

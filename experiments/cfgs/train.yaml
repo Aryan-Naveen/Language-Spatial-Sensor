@@ -5,11 +5,11 @@ defaults:
 
 # ── Training hyperparameters ──────────────────────────────────────────────────
 training:
-  epochs: 50
+  epochs: 25
   batch_size: 256
   # Learning rate — BERT params use lr * bert_lr_scale
   lr: 1.0e-4
-  bert_lr_scale: 0.1
+  bert_lr_scale: 0.0
   weight_decay: 1.0e-2
   warmup_steps: 500
   grad_clip: 1.0
@@ -27,10 +27,15 @@ training:
   bbox_cdf_eps: 1.0e-8
   # center_nll_loss hyperparameters (used when loss_type: center_nll)
   center_nll_lambda_l1: 1.0
+  # Mahalanobis (sqrt-quad) penalty: pulls down the right-tail of quad by
+  # pushing Σ wider where the mean is off — directly tightens NLL IQR.
   center_nll_lambda_mahal: 0.1
-  center_nll_lambda_vol: 0.01
+  # log|Σ| penalty: POSITIVE values pressure Σ *tighter*, which widens the
+  # NLL tail on bad-confident samples.  Zero lets the NLL term alone balance
+  # Σ against the data (standard MLE).  Keep small-or-zero for tight IQR.
+  center_nll_lambda_vol: 0.0
   # Conformal prediction metrics (validation only)
-  conformal_superset: true
+  conformal_superset: false
   conformal_coverage: 0.9
 
 # ── Cache ─────────────────────────────────────────────────────────────────────
@@ -44,13 +49,15 @@ cache:
 
 # ── Augmentations (applied to train split only) ───────────────────────────────
 augmentation:
-  # (a) probability of masking each non-anchor object
-  mask_prob: 0.05
-  # (b) random Z-axis rotation — max angle in degrees
-  rotate: true
-  rotate_max_deg: 5.0
-  # (c) Gaussian jitter on object centres (region-normalised units)
-  jitter_std: 0.02
+  # (a) Drop-object: hide non-anchor objects so the model can't memorise specific
+  #     object-to-object pairs and must rely on remaining spatial context.
+  mask_prob: 0.3
+  # (b) Full Z-axis symmetry: train on all yaw rotations so the model learns
+  #     relative geometry rather than absolute region coordinates.
+  rotate: false
+  rotate_max_deg: 180.0
+  # (c) Gaussian jitter on object centres (region-normalised units).
+  jitter_std: 0.05
 
 # ── Weights & Biases logging ──────────────────────────────────────────────────
 wandb:

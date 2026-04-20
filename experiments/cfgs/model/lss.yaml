@@ -15,6 +15,13 @@ spatial_relation_dim: 12  # mlp: 6+6 concat; center/vertical_bottom: 1, 4, or 5
 spatial_mlp_hidden: 64
 pairwise_rel_type: mlp         # mlp | center | vertical_bottom
 spatial_pairwise_dist_norm: true   # unused for mlp
+# FiLM the spatial-MLP hidden layer on text CLS so the bias depends on the query
+# (e.g. "above" can up-weight vertical pairs).
+condition_spatial_on_text: true
+
+# ── Anchor-centric coordinates ────────────────────────────────────────────────
+# Add an additive (centre − anchor-centroid) embedding to each object feature.
+use_anchor_centric_coords: true
 
 # ── Backbone ──────────────────────────────────────────────────────────────────
 backbone_type: scene_spatial
@@ -26,15 +33,20 @@ num_heads: 8
 ffn_dim: 1024
 
 # ── Pooling ───────────────────────────────────────────────────────────────────
-pooling_type: mean        # {mean, max, attention}
+# mean | max | attention | query_token
+# query_token: DETR-style target query prepended to the fusion sequence; its
+# post-fusion state is the context vector (no scene averaging).
+pooling_type: query_token
 
 # ── Output head ───────────────────────────────────────────────────────────────
 # gaussian_cholesky | gaussian_diagonal
 head_type: gaussian_cholesky
-# gaussian_diagonal only (safe defaults for cholesky head — unused)
 head_hidden_sizes: [1024, 512]
 head_dropout: 0.15
-head_min_sigma: 0.001
+# σ floor in region-normalised frame (region ≈ 1.0 per axis).
+# 0.05 ≈ 5% of region size — prevents variance collapse and caps the
+# NLL right-tail on confident-but-wrong samples. Raise for tighter IQR.
+head_min_sigma: 0.05
 
 # ── FiLM conditioning ─────────────────────────────────────────────────────────
 use_film: true

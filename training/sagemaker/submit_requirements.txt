@@ -1,0 +1,3 @@
+# Laptop / CI: dependencies for submit_lss_sweep.py (not the training container).
+sagemaker>=3.0
+boto3

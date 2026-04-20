@@ -11,6 +11,7 @@ Steps:
 5. Run the benchmark to compare proposer approaches
 """
 
+import random
 import sys
 from pathlib import Path
 import numpy as np
@@ -64,8 +65,33 @@ def init_sensor(LSS_ROOT, CHECKPOINT):
     return sensor
 
 
-def run_query(sensor, scene, sg, points, obj_split):
-    utterance = "there is a lamp."
+def _sample_utterance(scene, sg, seed: int | None = None) -> str:
+    """Pick a random referential statement from the dataset for this scene."""
+    stmts = scene.load_statements(sg)
+    if not stmts:
+        raise RuntimeError(f"No referential statements found for scene {scene.scene_id}")
+    rng = random.Random(seed)
+    return rng.choice(stmts).text
+
+
+def run_query(
+    sensor,
+    scene,
+    sg,
+    points,
+    obj_split,
+    sample_from_dataset: bool = False,
+    custom_utterance: str = "there is a lamp on the nightstand.",
+    seed: int | None = None,
+):
+    """Run a single query. Pass sample_from_dataset=True to pick a random
+    statement from the scene's referential-statements file; otherwise uses
+    ``custom_utterance``.
+    """
+    if sample_from_dataset:
+        utterance = _sample_utterance(scene, sg, seed=seed)
+    else:
+        utterance = custom_utterance
     print("\nUtterance:", utterance)
 
     result = sensor.predict(
@@ -89,7 +115,7 @@ def run_query(sensor, scene, sg, points, obj_split):
     print(f"\nSampled {len(samples)} points, shape={samples.shape}")
     print(f"GMM weighted mean: {result.mean}")
 
-    return result
+    return result, utterance
 
 
 def visualize(scene, sg, points, obj_split, result, utterance):
@@ -110,9 +136,44 @@ def visualize(scene, sg, points, obj_split, result, utterance):
     plt.show()
 
 
+def run_attention_demo(
+    sensor,
+    scene,
+    sg,
+    points,
+    obj_split,
+    sample_from_dataset: bool = False,
+    custom_utterance: str = "there is a lamp.",
+    seed: int | None = None,
+):
+    """Render per-layer MultiHeadAttentionSpatial attention on a BEV.
+
+    Pass ``sample_from_dataset=True`` to draw a random referential statement
+    from the scene; otherwise uses ``custom_utterance``.
+    """
+    from viz.attention import render_attention_bev
+
+    if sample_from_dataset:
+        utterance = _sample_utterance(scene, sg, seed=seed)
+    else:
+        utterance = custom_utterance
+
+    print(f"\nAttention demo · utterance: {utterance!r}")
+    fig = render_attention_bev(
+        sensor=sensor,
+        scene_graph=sg,
+        pc=points,
+        object_split=obj_split,
+        utterance=utterance,
+        scene_id=scene.scene_id,
+    )
+    plt.show()
+
+
 def run_benchmark(DATA_ROOT, CHECKPOINT):
     from evaluation.benchmark import (
         load_mini_val,
+        plot_cdf_histogram,
         run_benchmark,
         print_comparison_table,
     )
@@ -125,7 +186,7 @@ def run_benchmark(DATA_ROOT, CHECKPOINT):
     queries = load_mini_val(
         data_root=DATA_ROOT,
         datasets=["Unity", "3RScan"],
-        n=50,
+        n=2000,
     )
     LSS_ROOT = setup_paths()
     openai_proposer = LLMProposer(
@@ -141,24 +202,24 @@ def run_benchmark(DATA_ROOT, CHECKPOINT):
                 LSS_ROOT / "cache" / "clip_label_map.pt"
             ),            
         ),
-        "ollama_qwen": LanguageSpatialSensor(
-            CHECKPOINT,
-            LLMProposer(
-                provider="ollama",
-                model="qwen2.5:32b",
-                cache_dir="cache/proposer",
-            ),
-            clip_label_map=str(
-                LSS_ROOT / "cache" / "clip_label_map.pt"
-            ),            
-        ),
-        "openai": LanguageSpatialSensor(
-            CHECKPOINT,
-            openai_proposer,
-            clip_label_map=str(
-                LSS_ROOT / "cache" / "clip_label_map.pt"
-            ),            
-        ),        
+        # "ollama_qwen": LanguageSpatialSensor(
+        #     CHECKPOINT,
+        #     LLMProposer(
+        #         provider="ollama",
+        #         model="qwen2.5:32b",
+        #         cache_dir="cache/proposer",
+        #     ),
+        #     clip_label_map=str(
+        #         LSS_ROOT / "cache" / "clip_label_map.pt"
+        #     ),            
+        # ),
+        # "openai": LanguageSpatialSensor(
+        #     CHECKPOINT,
+        #     openai_proposer,
+        #     clip_label_map=str(
+        #         LSS_ROOT / "cache" / "clip_label_map.pt"
+        #     ),            
+        # ),        
     }
 
     results = run_benchmark(approaches, queries)
@@ -166,25 +227,30 @@ def run_benchmark(DATA_ROOT, CHECKPOINT):
     print("\n")
     print_comparison_table(results)
 
+    plot_cdf_histogram(results, metric="nll")
+    plt.show()
+
     for name, m in results.items():
         if "error" in m:
             continue
 
         print(f"\n=== {name} ===")
 
-        print("\nBy relation (CDF):")
-        for rel, stats in m["by_relation"]["cdf"].items():
+        print("\nBy relation (NLL):")
+        for rel, stats in m["by_relation"]["nll"].items():
             print(
-                f"  {rel:>10}: mean={stats['mean']:.4f} "
-                f"std={stats['std']:.4f} "
+                f"  {rel:>10}: median={stats['median']:.4f} "
+                f"IQR={stats['iqr']:.4f} "
+                f"[{stats['q25']:.3f}, {stats['q75']:.3f}] "
                 f"n={stats['count']}"
             )
 
-        print("\nBy ambiguity (RMSE):")
-        for amb, stats in m["by_ambiguity"]["rmse"].items():
+        print("\nBy ambiguity (NLL):")
+        for amb, stats in m["by_ambiguity"]["nll"].items():
             print(
-                f"  ambig={amb}: mean={stats['mean']:.3f}m "
-                f"std={stats['std']:.3f} "
+                f"  ambig={amb}: median={stats['median']:.3f} "
+                f"IQR={stats['iqr']:.3f} "
+                f"[{stats['q25']:.3f}, {stats['q75']:.3f}] "
                 f"n={stats['count']}"
             )
 
@@ -195,22 +261,15 @@ def main():
     DATA_ROOT = Path("/home/aryannav/mit/data/VLA-3D/VLA-3D_dataset")
     CHECKPOINT = LSS_ROOT / "checkpoints" / "best.pt"
 
-    # scene, sg, points, obj_split = load_scene(DATA_ROOT)
-    # sensor = init_sensor(LSS_ROOT, CHECKPOINT)
+    scene, sg, points, obj_split = load_scene(DATA_ROOT)
+    sensor = init_sensor(LSS_ROOT, CHECKPOINT)
 
-    # result = run_query(sensor, scene, sg, points, obj_split)
-
-    # visualize(
-    #     scene,
-    #     sg,
-    #     points,
-    #     obj_split,
-    #     result,
-    #     "there is a lamp.",
+    # run_attention_demo(
+    #     sensor, scene, sg, points, obj_split,
+    #     sample_from_dataset=True,
+    #     custom_utterance="there is a lamp.",
     # )
-
     run_benchmark(DATA_ROOT, CHECKPOINT)
-
 
 if __name__ == "__main__":
     main()

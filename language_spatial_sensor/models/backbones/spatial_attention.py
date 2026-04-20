@@ -49,6 +49,10 @@ class MultiHeadAttentionSpatial(nn.Module):
         # bias=False: spatial features are zero-mean; no constant offset needed.
         self.spatial_proj = nn.Linear(spatial_dim, num_heads, bias=False)
 
+        # Attention-capture hook (off by default; enabled by viz tooling).
+        self._store_attn: bool = False
+        self._last_attn_weights: torch.Tensor | None = None
+
     def forward(
         self,
         x: torch.Tensor,                    # (B, N, D)
@@ -83,6 +87,8 @@ class MultiHeadAttentionSpatial(nn.Module):
         # If every key is padded for a query row, logits are all -inf → softmax NaN.
         # Zero those weights so the head contributes nothing instead of poisoning the graph.
         attn_weights = torch.nan_to_num(attn_weights, nan=0.0)
+        if self._store_attn:
+            self._last_attn_weights = attn_weights.detach().to(torch.float32).cpu()
         attn_weights = F.dropout(attn_weights, p=self.dropout_p, training=self.training)
 
         out = torch.matmul(attn_weights, v)              # (B, H, N, d)

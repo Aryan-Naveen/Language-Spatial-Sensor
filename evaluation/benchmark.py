@@ -45,12 +45,6 @@ from evaluation.metrics import compute_all_metrics, proposer_precision_recall
 # Load evaluation queries from raw VLA-3D data
 # ---------------------------------------------------------------------------
 
-_CANONICAL = {
-    "3rscan": "3RScan", "arkitscenes": "ARKitScenes", "hm3d": "HM3D",
-    "matterport": "Matterport", "scannet": "Scannet", "unity": "Unity",
-}
-
-
 def load_eval_queries(
     data_root: str | Path,
     datasets: list[str],
@@ -62,103 +56,71 @@ def load_eval_queries(
 ) -> list[SpatialQuery]:
     """Load SpatialQuery objects for evaluation.
 
-    Reproduces the same splits as ``data/vla3d/splits.py`` to select val_seen
-    queries, then builds full SpatialQuery objects (including point clouds)
-    grouped by scene for efficient loading.
+    Delegates split construction to ``data.vla3d.splits.build_splits`` — the
+    same code path used by ``scripts/preprocess.py`` — so val_seen / val_unseen
+    here are *byte-identical* to the tensorised cache the model was trained on.
 
     Args:
         data_root:    Path to VLA-3D dataset root.
         datasets:     List of dataset names (e.g. ``["Unity", "3RScan"]``).
         split:        ``"val_seen"`` or ``"val_unseen"``.
-        max_samples:  If set, subsample to this many queries (mini-val).
-        seed:         Random seed for reproducibility.
+        max_samples:  If set, subsample deterministically to this many queries
+                      (mini-val). Applied *after* the canonical split, so
+                      ``max_samples=None`` gives the full training-equivalent split.
+        seed:         Random seed (must match training's ``splits.seed``).
+        val_seen_stmt_frac:    Must match training's ``splits.val_seen_stmt_frac``.
+        val_unseen_scene_frac: Must match training's ``splits.val_unseen_scene_frac``.
     """
-    from data.vla3d.dataset import VLA3D, VLA3DScene
-    from language_spatial_sensor.core.ontology import VALID_NYU40_LABELS, VALID_RELATIONS
+    from omegaconf import OmegaConf
 
-    data_root = Path(data_root)
-    rng = random.Random(seed)
+    from data.vla3d.splits import build_splits
 
-    # Collect all scenes
-    all_scenes: list[VLA3DScene] = []
-    for name in datasets:
-        canonical = _CANONICAL.get(name.lower(), name)
-        ds_path = data_root / canonical
-        if ds_path.exists():
-            all_scenes.extend(VLA3D(ds_path).scenes())
+    # Reconstruct the same DictConfig shape build_splits expects from cfg.data.
+    cfg = OmegaConf.create({
+        "data_root": str(data_root),
+        "datasets":  list(datasets),
+        "splits": {
+            "seed":                  seed,
+            "val_seen_stmt_frac":    val_seen_stmt_frac,
+            "val_unseen_scene_frac": val_unseen_scene_frac,
+        },
+    })
+    splits = build_splits(cfg)
 
-    if not all_scenes:
-        raise FileNotFoundError(f"No scenes found under {data_root}")
-
-    # Reproduce scene-level split
-    shuffled = all_scenes[:]
-    rng.shuffle(shuffled)
-    n_unseen = max(1, round(len(shuffled) * val_unseen_scene_frac))
-    unseen_scenes = set(s.scene_id for s in shuffled[-n_unseen:])
-    seen_scenes = [s for s in shuffled if s.scene_id not in unseen_scenes]
-    unseen_scene_list = [s for s in shuffled if s.scene_id in unseen_scenes]
-
-    # Filter statements helper
-    def _filter(sg, stmts):
-        obj_label = {
-            obj.id: str(obj.metadata.get("nyu40_label", "")).lower().strip()
-            for obj in sg.objects
-        }
-        return [
-            s for s in stmts
-            if s.relation in VALID_RELATIONS
-            and obj_label.get(s.target_object_id, "") in VALID_NYU40_LABELS
-            and all(obj_label.get(aid, "") in VALID_NYU40_LABELS for aid in (s.anchor_object_id or []))
-        ]
-
-    # Collect split records: (scene, statement)
-    records: list[tuple[VLA3DScene, Any]] = []
-
-    target_scenes = seen_scenes if split == "val_seen" else unseen_scene_list
-
-    for scene in target_scenes:
-        try:
-            sg = scene.load_scene_graph()
-            stmts = _filter(sg, scene.load_statements(sg))
-        except Exception:
-            continue
-
-        if split == "val_seen":
-            rng_stmt = random.Random(seed)
-            rng_stmt.shuffle(stmts)
-            n_val = max(1, round(len(stmts) * val_seen_stmt_frac)) if stmts else 0
-            for s in stmts[:n_val]:
-                records.append((scene, s))
-        else:
-            for s in stmts:
-                records.append((scene, s))
+    if split == "val_seen":
+        records = splits.val_seen
+    elif split == "val_unseen":
+        records = splits.val_unseen
+    else:
+        raise ValueError(f"Unknown split {split!r} (expected 'val_seen' or 'val_unseen')")
 
     if max_samples is not None and len(records) > max_samples:
         rng_sub = random.Random(seed + 1)
         records = rng_sub.sample(records, max_samples)
 
-    # Build SpatialQuery objects, grouped by scene for efficient PC loading
-    by_scene: dict[str, list[tuple[VLA3DScene, Any]]] = defaultdict(list)
-    for scene, stmt in records:
-        by_scene[scene.scene_id].append((scene, stmt))
+    # Group by scene so each scene's point cloud is loaded exactly once.
+    by_scene: dict[str, list] = defaultdict(list)
+    for rec in records:
+        by_scene[rec.scene.scene_id].append(rec)
 
     queries: list[SpatialQuery] = []
-    for scene_id, scene_stmts in tqdm(by_scene.items(), desc=f"Loading {split}"):
-        scene = scene_stmts[0][0]
+    for scene_id, recs in tqdm(by_scene.items(), desc=f"Loading {split}"):
+        scene = recs[0].scene
         try:
-            sg = scene.load_scene_graph()
-            pcd = scene.load_pointcloud()
-            points = np.asarray(pcd.points, dtype=np.float32)
+            sg        = scene.load_scene_graph()
+            pcd       = scene.load_pointcloud()
+            points    = np.asarray(pcd.points, dtype=np.float32)
             obj_split = scene.load_object_split()
         except Exception as e:
             print(f"[eval] Skipping {scene_id}: {e}")
             continue
 
-        for _, stmt in scene_stmts:
+        for rec in recs:
+            stmt = rec.statement
             try:
                 q = build_spatial_query(scene_id, sg, stmt, points, obj_split)
-                q.metadata["relation"] = stmt.relation
-                q.metadata["ambiguity"] = stmt.ambiguity
+                q.metadata["relation"]         = stmt.relation
+                q.metadata["ambiguity"]        = stmt.ambiguity
                 q.metadata["target_object_id"] = stmt.target_object_id
                 queries.append(q)
             except Exception as e:
@@ -224,6 +186,8 @@ def run_benchmark(
                     object_split=q.object_split,
                     target_xyz=q.target_xyz,
                     target_bbox=q.target_bbox,
+                    gt_anchor_object_ids=q.gt_anchor_object_ids,
+                    gt_anchor_room_id=q.gt_anchor_room_id,
                 )
                 results.append(r)
                 groundings_per_query.append(r.groundings)
@@ -273,11 +237,55 @@ def run_benchmark(
     return all_results
 
 
+def plot_cdf_histogram(
+    results: dict[str, dict[str, Any]],
+    metric: str = "cdf",
+    bins: int = 20,
+    ax=None,
+):
+    """Plot a density histogram of per-query scores across approaches.
+
+    Args:
+        results: Output of :func:`run_benchmark`.
+        metric:  One of ``"cdf"``, ``"rmse"``, ``"nll"``.
+        bins:    Histogram bin count (or a bin-edge array passed to matplotlib).
+        ax:      Optional matplotlib Axes to draw onto.  A new figure is created if omitted.
+
+    Returns:
+        The matplotlib Axes containing the plot.
+    """
+    import matplotlib.pyplot as plt
+
+    if ax is None:
+        _, ax = plt.subplots(figsize=(7, 4))
+
+    range_ = (0.0, 1.0) if metric == "cdf" else None
+
+    for name, m in results.items():
+        vals = m.get("per_query", {}).get(metric)
+        if not vals:
+            continue
+        ax.hist(
+            vals,
+            bins=bins,
+            range=range_,
+            density=True,
+            alpha=0.5,
+            label=f"{name} (n={len(vals)})",
+        )
+
+    ax.set_xlabel({"cdf": "CDF at GT", "rmse": "RMSE (m)", "nll": "NLL"}.get(metric, metric))
+    ax.set_ylabel("Density")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    return ax
+
+
 def print_comparison_table(
     results: dict[str, dict[str, Any]],
 ) -> None:
     """Print a formatted comparison table across approaches."""
-    header = f"{'Approach':<15} {'CDF':>8} {'RMSE':>8} {'NLL':>8} {'Acc':>8} {'ECE':>8} {'P(prop)':>8} {'R(prop)':>8}"
+    header = f"{'Approach':<15} {'CDF':>8} {'RMSE':>8} {'NLL':>8} {'NLL(IQR)':>9} {'Acc':>8} {'ECE':>8} {'P(prop)':>8} {'R(prop)':>8}"
     print(header)
     print("-" * len(header))
     for name, m in results.items():
@@ -291,6 +299,7 @@ def print_comparison_table(
             f"{o.get('cdf_mean', 0):.4f}  "
             f"{o.get('rmse_mean', 0):.3f}m "
             f"{o.get('nll_mean', 0):>7.2f}  "
+            f"{o.get('nll_iqr', 0):>8.2f}  "
             f"{o.get('accuracy', 0):.3f}   "
             f"{o.get('ece', 0):.4f}  "
             f"{p.get('proposer_precision', 0):.3f}   "
