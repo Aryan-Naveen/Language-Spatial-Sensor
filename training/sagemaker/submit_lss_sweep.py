@@ -20,9 +20,9 @@ BEFORE RUNNING
 OPTUNA DB ACCESS
 ----------------
 The sweep writes `optuna.db` to the SageMaker checkpoint volume, which is
-continuously synced to `s3://{BUCKET_NAME}/{CKPT_PREFIX}/{JOB}/optuna.db`.
-Pull it at any time with:
-    aws s3 cp s3://{BUCKET_NAME}/{CKPT_PREFIX}/<JOB>/optuna.db ./optuna.db
+continuously synced to `s3://{BUCKET_NAME}/{CKPT_PREFIX}/ckpts/{STAMP}/optuna.db`
+(path printed at end of submit). Pull it at any time with:
+    aws s3 cp s3://{BUCKET_NAME}/{CKPT_PREFIX}/ckpts/<STAMP>/optuna.db ./optuna.db
 
 ENV OVERRIDES
 -------------
@@ -30,7 +30,7 @@ LSS_BUCKET            S3 bucket name
 LSS_DATA_PREFIX       S3 prefix for the tensor cache
 LSS_CKPT_PREFIX       S3 prefix for the checkpoint volume (holds optuna.db)
 LSS_SAGEMAKER_ROLE    IAM execution role ARN
-LSS_INSTANCE_TYPE     SageMaker instance (default ml.g6e.8xlarge = 4×L40S)
+LSS_INSTANCE_TYPE     SageMaker instance (default ml.g6e.12xlarge = 4×L40S)
 LSS_TRAINING_IMAGE    Full ECR URI override (skip DLC auto-resolve)
 LSS_MAX_RUNTIME       Wall-clock cap in seconds (default 259200 = 72h)
 LSS_N_TRIALS          Total trials across all workers (default 64)
@@ -61,11 +61,13 @@ if _compat.exists():
 
 try:
     from sagemaker.train.model_trainer import ModelTrainer
-    from sagemaker.train.configs import (
-        Compute,
-        InputData,
-        OutputDataConfig,
+    from sagemaker.core.training.configs import (
+        Channel,
         CheckpointConfig,
+        Compute,
+        DataSource,
+        OutputDataConfig,
+        S3DataSource,
         SourceCode,
         StoppingCondition,
     )
@@ -86,7 +88,7 @@ DATA_PREFIX    = os.environ.get("LSS_DATA_PREFIX",    "lss/cache")
 CKPT_PREFIX    = os.environ.get("LSS_CKPT_PREFIX",    "lss/sweeps")
 SAGEMAKER_ROLE = os.environ.get("LSS_SAGEMAKER_ROLE",
                                 "arn:aws:iam::317694661330:role/SageMakerExecutionRole")
-INSTANCE_TYPE  = "ml.g6e.8xlarge"  # 4× L40S
+INSTANCE_TYPE  = "ml.g6e.12xlarge"  # 4× L40S (8xlarge has only 1 GPU)
 TRAINING_IMAGE = os.environ.get("LSS_TRAINING_IMAGE", "").strip()
 MAX_RUNTIME    = int(os.environ.get("LSS_MAX_RUNTIME", "259200"))        # 72h
 
@@ -100,7 +102,9 @@ HYPERPARAMETERS = {
     "n_trials_total":  os.environ.get("LSS_N_TRIALS",       "64"),
     "epochs":          os.environ.get("LSS_TRIAL_EPOCHS",   "24"),
     "batch_size":      os.environ.get("LSS_TRIAL_BATCH_SIZE", "128"),
-    "num_workers":     "4",
+    # 4 trial processes × 12 workers = 48 = all vCPUs on ml.g6e.12xlarge.
+    # Max S3 GET fan-out for FastFile without oversubscribing.
+    "num_workers":     "12",
     "study_name":      STUDY_NAME,
     "nproc_per_node":  "",  # auto-detect
 }
@@ -112,7 +116,10 @@ IGNORE_PATTERNS = [
     ".env", ".venv", "venv",
     ".DS_Store",
     "cache",           # 468 GB — must stay out of the source bundle
+    "cache_shards",    # 469 GB — renamed cache; same reason
     "outputs", "checkpoints", "wandb", "multirun",
+    "results",         # benchmark CSV outputs
+    "optuna.db",       # local Optuna state file
     "*.ipynb", ".ipynb_checkpoints",
 ]
 
@@ -125,7 +132,11 @@ def main() -> None:
 
     data_uri  = f"s3://{BUCKET_NAME}/{DATA_PREFIX}".rstrip("/") + "/"
     s3_output = f"s3://{BUCKET_NAME}/{CKPT_PREFIX.strip('/')}"       # model artifacts
-    s3_ckpt   = f"{s3_output}/{job}"                                  # optuna.db lives here
+    # SageMaker appends its own stamp to `base_job_name`, so the real
+    # TrainingJobName is `{job}-{sagemaker_stamp}` — we can't predict it before
+    # submit. Pin the checkpoint path to `stamp` (known) instead of `job` so the
+    # optuna.db URI we print here is guaranteed correct.
+    s3_ckpt   = f"{s3_output}/ckpts/{stamp}"                          # optuna.db lives here
 
     if TRAINING_IMAGE:
         training_image = TRAINING_IMAGE
@@ -172,11 +183,18 @@ def main() -> None:
     )
 
     print("\nSubmitting sweep job...")
+    # FastFile mode streams files on demand — essential for the 1.4M-file cache.
+    # In the new SDK, input_mode lives on Channel (not InputData), and the data
+    # source must be an explicit S3DataSource.
     trainer.train(
-        input_data_config=[InputData(
+        input_data_config=[Channel(
             channel_name="cache",
-            data_source=data_uri,
-            # FastFile mode streams files on demand — essential for the 1.4M-file cache.
+            data_source=DataSource(
+                s3_data_source=S3DataSource(
+                    s3_data_type="S3Prefix",
+                    s3_uri=data_uri,
+                ),
+            ),
             input_mode="FastFile",
         )],
     )
@@ -185,8 +203,12 @@ def main() -> None:
     name = getattr(tj, "training_job_name", None) or str(tj)
     print("\n" + "=" * 72)
     print(f"Job submitted:   {name}")
-    print(f"Optuna DB:       s3://{BUCKET_NAME}/{CKPT_PREFIX}/{name}/optuna.db")
-    print(f"Pull with:       aws s3 cp s3://{BUCKET_NAME}/{CKPT_PREFIX}/{name}/optuna.db ./optuna.db")
+    # The live optuna.db is held open by the workers so SageMaker's sync only
+    # captures its initial (empty) state. optuna_snapshot.db is an atomic
+    # `.backup()` copy refreshed every 60 s — always pull that one.
+    print(f"Optuna DB:       {s3_ckpt}/optuna_snapshot.db  (refreshed every 60 s)")
+    print(f"Pull with:       aws s3 cp {s3_ckpt}/optuna_snapshot.db ./optuna.db")
+    print(f"Worker logs:     CloudWatch (search for '[gpu=N]' in the log stream)")
     print(f"Console:         https://console.aws.amazon.com/sagemaker/home?region={region}#/training-jobs/{name}")
     print("=" * 72)
 

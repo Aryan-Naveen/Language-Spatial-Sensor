@@ -1,6 +1,6 @@
 # LSS — AWS SageMaker Optuna Hyperparameter Sweep
 
-Runs an Optuna HPO sweep for the Language Spatial Sensor on **`ml.g6e.8xlarge`**
+Runs an Optuna HPO sweep for the Language Spatial Sensor on **`ml.g6e.12xlarge`**
 (4× NVIDIA L40S, 32 vCPU, 256 GB RAM) — the same instance used by LangSteer's
 `submit_langsteer_training.py`. One Optuna worker per GPU, all writing to a
 single `optuna.db`. No W&B.
@@ -8,7 +8,7 @@ single `optuna.db`. No W&B.
 ## Architecture at a glance
 
 ```
-SageMaker job (ml.g6e.8xlarge, 4× L40S)
+SageMaker job (ml.g6e.12xlarge, 4× L40S)
 └─ train_lss_sagemaker.py
    ├─ spawns 4 × optuna_sweep.py (one per GPU)
    │    ├─ samples hparams via TPE
@@ -68,53 +68,79 @@ Edit the search space in [`optuna_sweep.py::_suggest_hparams`](optuna_sweep.py).
 
 ---
 
-## 1 — Upload the tensor cache to S3
+## 1 — Build and upload the tar-sharded cache to S3
 
-The training code reads pre-tensorized `.pt` files from
-[`cache/`](../../cache/) built by [`scripts/preprocess.py`](../../scripts/preprocess.py):
+The training code reads pre-tensorized samples from a local cache built by
+[`scripts/preprocess.py`](../../scripts/preprocess.py). `preprocess.py` emits
+one `.pt` file per sample (1.4M small files, ~412 GB for train). That layout
+is fine on local NVMe but **catastrophic on SageMaker FastFile** — each
+sample becomes one S3 GET, and training becomes network-latency-bound at
+~2.7 s/step.
 
-```
-cache/
-├── train/       manifest.json + 1,399,295 *.pt files   (412 GB)
-├── val_seen/    manifest.json + 74,390 *.pt files      (22 GB)
-└── val_unseen/  manifest.json + 116,085 *.pt files     (35 GB)
-```
+**Fix:** pack samples into ~1000-sample tar shards with
+[`scripts/build_shards.py`](../../scripts/build_shards.py) before uploading.
+One S3 GET per shard amortises network overhead across ~1000 samples and
+gets per-step time to near-GPU-bound (~0.1 s/step). `train.py` auto-detects
+the shard layout via a `shards.json` index, so there are no code toggles.
 
-**Only this directory needs to go to S3.** Raw VLA-3D scene data is NOT needed
-— BEV visualisation (which uses it) is disabled for sweep runs.
+### a) Build shards locally (or on EC2)
 
 ```bash
-# From the lss/ root — takes hours over a home connection.
-# Recommended: run this from an EC2 instance in the same region as your bucket.
-export BUCKET=calvin-abcd-dataset-bucket          # your bucket
-aws s3 sync cache/ s3://$BUCKET/lss/cache/ \
-    --exclude "proposer/*" \
-    --exclude "clip_label_map.pt"
+# Run on the machine that already has cache/ built by preprocess.py.
+python scripts/build_shards.py \
+    --cache-dir cache \
+    --out-dir   cache_shards
 ```
 
-Only `cache/{train,val_seen,val_unseen}/` is required; the exclude flags above
-drop the proposer artifacts and CLIP label map (not used at training time).
+Output layout:
 
-### Transfer tips (1.4M small files)
+```
+cache_shards/
+├── train/       shard-000000.tar … shard-00136X.tar + shards.json   (~412 GB)
+├── val_seen/    shard-000000.tar … + shards.json                    (~22 GB)
+└── val_unseen/  shard-000000.tar … + shards.json                    (~35 GB)
+```
 
-- **Use `aws s3 sync` with high concurrency.** First do:
-  ```bash
-  aws configure set default.s3.max_concurrent_requests 64
-  aws configure set default.s3.max_queue_size 10000
-  ```
-- **Consider an EC2 staging node** (e.g. `c6in.4xlarge`) in the same region
-  as the bucket — the upload becomes limited by backbone, not your ISP.
-- **Alternative:** tar each split into a few shards and upload those instead
-  of 1.4M tiny objects. Not required for `FastFile` mode (see below) but
-  dramatically faster to upload.
+Approx. runtime: ~20-40 min on a local NVMe machine (pure I/O copy, no
+decode). Per-shard progress + ETA prints to stdout.
 
-### Why FastFile mode, not File mode
+### b) Upload shards to S3
 
-SageMaker's default `File` mode copies all input to the container's EBS volume
-before training starts — that's a ~2-hour stall for 468 GB of tiny files.
-`submit_lss_sweep.py` sets `input_mode="FastFile"`, which mounts the S3
-prefix as a FUSE filesystem and streams files lazily on demand. First-epoch
-reads are slower but total wall time is much lower.
+```bash
+export BUCKET=lang-map-lss          # your bucket
+aws configure set default.s3.max_concurrent_requests 64
+aws configure set default.s3.max_queue_size 10000
+
+aws s3 sync cache_shards/ s3://$BUCKET/lss/cache_shards/
+```
+
+Only ~1500 tar objects total (vs 1.4M `.pt` files) — this upload finishes
+in ~30-60 min over a decent connection instead of many hours.
+
+### c) Point the sweep at the sharded prefix
+
+Set `LSS_DATA_PREFIX=lss/cache_shards` before submitting (or edit
+`DATA_PREFIX` in [submit_lss_sweep.py](submit_lss_sweep.py)).
+
+```bash
+export LSS_DATA_PREFIX=lss/cache_shards
+python training/sagemaker/submit_lss_sweep.py
+```
+
+### Why FastFile mode (still)
+
+`submit_lss_sweep.py` keeps `input_mode="FastFile"`. With tar shards each
+GET is ~500 MB of sequential bytes — exactly what FastFile's FUSE layer is
+good at streaming. `File` mode would download all 468 GB to EBS up front
+(~30 min stall every job) for no further speedup once shards are in use.
+
+### Local runs (unchanged)
+
+`train.py` auto-detects the cache format per split — if the split directory
+has `shards.json`, it uses the streaming reader; otherwise it falls back to
+the original `.pt` map-style dataset. Local smoke tests, BEV viz, and every
+prior workflow continue to work against a `.pt` cache. Shard only when you
+need to ship the cache to SageMaker.
 
 ---
 
@@ -125,8 +151,8 @@ reads are slower but total wall time is much lower.
 pip install -r training/sagemaker/submit_requirements.txt
 aws configure                    # or rely on an IAM role
 
-# If you haven't used ml.g6e.8xlarge before, request quota in AWS Console →
-# Service Quotas → SageMaker → "ml.g6e.8xlarge for training".
+# If you haven't used ml.g6e.12xlarge before, request quota in AWS Console →
+# Service Quotas → SageMaker → "ml.g6e.12xlarge for training".
 ```
 
 Verify the SageMaker execution role has: `AmazonSageMakerFullAccess` + S3
@@ -143,7 +169,7 @@ BUCKET_NAME    = "calvin-abcd-dataset-bucket"                         # your buc
 DATA_PREFIX    = "lss/cache"                                         # where you synced the cache
 CKPT_PREFIX    = "lss/sweeps"                                        # optuna.db lands here
 SAGEMAKER_ROLE = "arn:aws:iam::317694661330:role/SageMakerExecutionRole"
-INSTANCE_TYPE  = "ml.g6e.8xlarge"
+INSTANCE_TYPE  = "ml.g6e.12xlarge"
 ```
 
 Everything above is overridable via env vars (`LSS_BUCKET`, `LSS_DATA_PREFIX`,
@@ -164,7 +190,7 @@ You'll see:
 ```
 Role:              arn:aws:iam::.../SageMakerExecutionRole
 Image:             763104351884.dkr.ecr.us-east-1.amazonaws.com/pytorch-training:2.4.0-gpu-py311-...
-Instance:          ml.g6e.8xlarge
+Instance:          ml.g6e.12xlarge
 Input cache (S3):  s3://calvin-abcd-dataset-bucket/lss/cache/
 Checkpoints (S3):  s3://calvin-abcd-dataset-bucket/lss/sweeps/lss-sweep-YYYYMMDDHHMMSS/
 Study name:        lss_sweep_YYYYMMDD_HHMMSS
@@ -182,14 +208,18 @@ Console or via `aws sagemaker describe-training-job --training-job-name $JOB`.
 
 ---
 
-## 5 — Download `optuna.db` whenever you want
+## 5 — Download `optuna_snapshot.db` whenever you want
 
-`CheckpointConfig` syncs `/opt/ml/checkpoints` ↔ S3 **every few seconds while
-the job runs.** Pull the DB any time:
+SageMaker's `CheckpointConfig` can't reliably re-upload a live SQLite file —
+the workers hold the connection open and sync skips it after the first pass.
+To work around this, `optuna_sweep.py` runs a daemon on worker 0 that calls
+SQLite's online `.backup()` every 60 s to produce `optuna_snapshot.db` — an
+atomic, closed, sync-friendly copy. Always pull the snapshot, not the live
+DB.
 
 ```bash
-JOB=lss-sweep-20260420180000       # from the submit output
-aws s3 cp s3://$BUCKET/lss/sweeps/$JOB/optuna.db ./optuna.db
+STAMP=20260420180000       # from the submit output
+aws s3 cp s3://$BUCKET/lss/sweeps/ckpts/$STAMP/optuna_snapshot.db ./optuna.db
 
 # Inspect locally
 optuna-dashboard sqlite:///./optuna.db
@@ -264,12 +294,54 @@ into a new `local_path` for the next run.
 
 | Symptom | Fix |
 |---------|-----|
-| `ResourceLimitExceeded` on submit | AWS Console → Service Quotas → SageMaker → request `ml.g6e.8xlarge` quota |
+| `ResourceLimitExceeded` on submit | AWS Console → Service Quotas → SageMaker → request `ml.g6e.12xlarge` quota |
 | `FileNotFoundError: ... train/` | Verify `aws s3 ls s3://$BUCKET/lss/cache/train/` shows `manifest.json` + `*.pt`. Re-check `DATA_PREFIX`. |
 | SQLite `database is locked` | Rare with 4 workers + WAL. If it persists, reduce `nproc_per_node` to 2 or swap `RDBStorage` for `JournalFileStorage` in `optuna_sweep.py`. |
 | DataLoader workers OOM | Drop `OPTUNA_NUM_WORKERS` from 4 → 2. Per-GPU we have 256 GB / 4 GPUs = ~64 GB RAM headroom. |
 | DLC image not found | Set `LSS_TRAINING_IMAGE` to a known ECR URI (check LangSteer's submit_langsteer_training.py output for a working URI). |
-| Trial fails instantly on `roberta-base` / MiniLM | Some HF models have a different CLS-token convention; trim the `text_model` list in `_suggest_hparams`. |
+---
+
+## Local smoke test (before you submit)
+
+Run these on your laptop to catch bugs cheaper than a SageMaker job.
+
+### a) Verify every `text_model` loads + pools correctly
+
+```bash
+pytest tests/test_text_encoder_variants.py -v
+```
+
+Parametrized across all six HF backbones the sweep can sample. Checks: auto
+hidden-size derivation, per-family pooling (CLS vs. mean + L2 norm),
+gradient flow, and tokenizer shape compatibility. First run downloads
+~2 GB of HF weights into `$HF_HOME`; subsequent runs are instant.
+
+### b) Run one real Optuna trial end-to-end
+
+Requires the `cache/` directory built by `scripts/preprocess.py`. One trial
+takes ~1–2 min on a single GPU with these tiny overrides:
+
+```bash
+cd /path/to/lss
+OPTUNA_DB_PATH=/tmp/smoke_optuna.db \
+OPTUNA_STUDY_NAME=smoke \
+OPTUNA_N_TRIALS=1 \
+OPTUNA_EPOCHS=1 \
+OPTUNA_BATCH_SIZE=8 \
+OPTUNA_NUM_WORKERS=0 \
+OPTUNA_CACHE_DIR=$(pwd)/cache \
+CUDA_VISIBLE_DEVICES=0 \
+python training/sagemaker/optuna_sweep.py
+```
+
+Expected output ends with `[gpu=0] finished. best_value=...`. This exercises
+the full path: hparam sampling → Hydra overrides → tokenizer + model build →
+training loop → DB write. Delete `/tmp/smoke_optuna.db` between runs to start
+fresh.
+
+To force a specific `text_model` for the trial, temporarily edit the
+relevant `trial.suggest_categorical` in `optuna_sweep.py::_suggest_hparams`
+to a single-element list, or wrap it in `os.environ.get("SMOKE_TEXT_MODEL")`.
 
 ---
 
@@ -281,7 +353,7 @@ into a new `local_path` for the next run.
 | `LSS_DATA_PREFIX` | `lss/cache` | submit |
 | `LSS_CKPT_PREFIX` | `lss/sweeps` | submit |
 | `LSS_SAGEMAKER_ROLE` | see script | submit |
-| `LSS_INSTANCE_TYPE` | `ml.g6e.8xlarge` | submit |
+| `LSS_INSTANCE_TYPE` | `ml.g6e.12xlarge` | submit |
 | `LSS_TRAINING_IMAGE` | *(DLC auto-resolve)* | submit |
 | `LSS_MAX_RUNTIME` | `259200` (72h) | submit |
 | `LSS_N_TRIALS` | `64` | submit → container |

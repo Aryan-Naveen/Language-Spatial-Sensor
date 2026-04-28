@@ -30,7 +30,7 @@ from language_spatial_sensor.models.backbones.spatial_attention import (
     MultiHeadAttentionSpatial,
     SceneSpatialEncoder,
 )
-from language_spatial_sensor.pipeline.language_sensor import _to_device
+from language_spatial_sensor.pipeline.distribution_predictor import _to_device
 from viz.bev import (
     _nyu40_label,
     fit_floor_ceiling_semantic,

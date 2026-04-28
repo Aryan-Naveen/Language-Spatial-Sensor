@@ -91,7 +91,7 @@ DEFAULT_HYPERPARAMETERS: dict[str, str] = {
     "n_trials_total": "64",       # split evenly across GPUs
     "epochs":         "6",        # per trial — keep short for sweep breadth
     "batch_size":     "128",      # per GPU
-    "num_workers":    "4",        # DataLoader workers per trial
+    "num_workers":    "12",       # DataLoader workers per trial (4 trials × 12 = 48 vCPU)
     "study_name":     f"lss_sweep_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
     "nproc_per_node": "",         # empty = auto-detect
 }
@@ -149,19 +149,24 @@ def main() -> None:
 
     procs: list[subprocess.Popen] = []
     sweep_script = root / "training" / "sagemaker" / "optuna_sweep.py"
-    log_dir = ckpt_dir / "logs"
-    log_dir.mkdir(parents=True, exist_ok=True)
 
+    # Route worker output to CloudWatch (parent stdout/stderr) instead of to
+    # files. CheckpointConfig only syncs /opt/ml/checkpoints every ~few seconds
+    # and can silently lag on small writes, making mid-run debugging impossible.
+    # CloudWatch streams in real time, with no sync dependency. Trade-off: 4
+    # workers' output is interleaved — each line is prefixed with [gpu=N] by
+    # optuna_sweep.py so it's still grep-able.
     for gpu_id in range(n_gpus):
         env = dict(common_env)
         env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
         env["OPTUNA_N_TRIALS"]      = str(per_worker[gpu_id])
-        log_path = log_dir / f"worker_gpu{gpu_id}.log"
-        logf = open(log_path, "ab", buffering=0)
-        print(f"  → spawning worker gpu={gpu_id} log={log_path}", flush=True)
+        print(f"  → spawning worker gpu={gpu_id}", flush=True)
         procs.append(subprocess.Popen(
-            [sys.executable, str(sweep_script)],
-            env=env, stdout=logf, stderr=subprocess.STDOUT, cwd=str(root),
+            [sys.executable, "-u", str(sweep_script)],
+            env=env,
+            stdout=sys.stdout,
+            stderr=sys.stderr,
+            cwd=str(root),
         ))
         # Stagger a bit so all workers don't hit `create_study` simultaneously.
         time.sleep(2)

@@ -23,13 +23,14 @@ Usage::
 
 from __future__ import annotations
 
+import io
 import json
 import re
 from dataclasses import fields, replace
 from pathlib import Path
 
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, IterableDataset
 from transformers import AutoTokenizer
 
 from language_spatial_sensor.core.schema import CachedSample, TensorizerOutput
@@ -105,6 +106,91 @@ class CachedLSSDataset(Dataset):
             item = self.augmentations(item)
 
         return item
+
+
+class ShardedLSSDataset(IterableDataset):
+    """WebDataset-backed streaming reader over tar-sharded cache.
+
+    Each shard holds ~1024 pickled ``CachedSample`` objects as ``.sample`` tar
+    members. One S3 GET fetches one shard, amortising ~500 ms of network
+    overhead across ~1024 samples — roughly 1000× fewer round-trips than the
+    per-sample ``.pt`` layout for the same training budget.
+
+    Args:
+        cache_dir:      Directory containing ``shards.json`` + ``shard-*.tar``.
+        augmentations:  Optional callable applied to each loaded item.
+        shuffle_buffer: Reservoir size for in-flight sample shuffle. Set to 0
+                        for no shuffle (validation). 8000 is a good training
+                        default — large enough to mix across many shards, small
+                        enough to fit in RAM with many workers.
+        shardshuffle:   If True, shuffle the shard list each epoch. Required
+                        for proper training-set randomisation.
+    """
+
+    def __init__(
+        self,
+        cache_dir: str | Path,
+        augmentations=None,
+        shuffle_buffer: int = 0,
+        shardshuffle: bool = False,
+    ) -> None:
+        super().__init__()
+        self.cache_dir      = Path(cache_dir)
+        self.augmentations  = augmentations
+        self.shuffle_buffer = shuffle_buffer
+        self.shardshuffle   = shardshuffle
+
+        index_path = self.cache_dir / "shards.json"
+        if not index_path.exists():
+            raise FileNotFoundError(
+                f"No shards.json at {index_path}. "
+                "Build shards first with scripts/build_shards.py."
+            )
+        with open(index_path) as f:
+            index = json.load(f)
+
+        self._shard_files: list[str] = index["shards"]
+        self._n_samples:   int       = int(index["n_samples"])
+
+    def __len__(self) -> int:
+        return self._n_samples
+
+    def __iter__(self):
+        # Lazy import: webdataset is a training-container dep; local .pt paths
+        # don't need it.
+        import webdataset as wds
+
+        urls = [str(self.cache_dir / name) for name in self._shard_files]
+
+        # webdataset ≥0.2.86 requires an int or False — True is deprecated.
+        # Passing the full shard count means "shuffle across all shards each epoch".
+        shard_shuffle_n = len(urls) if self.shardshuffle else False
+
+        pipeline = wds.WebDataset(
+            urls,
+            shardshuffle=shard_shuffle_n,
+            nodesplitter=wds.split_by_node,
+        )
+        if self.shuffle_buffer > 0:
+            pipeline = pipeline.shuffle(self.shuffle_buffer)
+
+        for record in pipeline:
+            raw = record.get("sample")
+            if raw is None:
+                # Corrupt shard / unexpected member — skip with a warning.
+                continue
+            item: CachedSample = torch.load(
+                io.BytesIO(raw), weights_only=False, map_location="cpu"
+            )
+            item = _coerce_target_bbox_aabb6(item)
+            if self.augmentations is not None:
+                item = self.augmentations(item)
+            yield item
+
+
+def is_sharded_cache(cache_dir: str | Path) -> bool:
+    """True if the given split directory holds tar shards instead of .pt files."""
+    return (Path(cache_dir) / "shards.json").is_file()
 
 
 class CollateFn:

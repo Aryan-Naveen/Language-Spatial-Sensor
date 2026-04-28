@@ -239,7 +239,11 @@ def make_bev_grid(
 
 
 _GRAYSCALE = np.array([0.55, 0.55, 0.55], dtype=np.float32)
-_HIGHLIGHT  = np.array([0.20, 0.50, 0.90], dtype=np.float32)  # steel blue
+# Vivid magenta — chosen to stay well clear of every entry in ``_PALETTE``
+# so the anchor highlight never collides with a semantic colour when
+# ``semantic_background=True``. Nearest palette neighbour is ``person``
+# (RGB distance ≈ 0.39).
+_HIGHLIGHT  = np.array([0.93, 0.11, 0.65], dtype=np.float32)
 
 
 def make_semantic_bev(
@@ -250,6 +254,8 @@ def make_semantic_bev(
     margin: float = 0.5,
     highlight_labels: set[str] | None = None,
     highlight_object_ids: set[int] | None = None,
+    semantic_background: bool = False,
+    anchor_semantic_fill: bool = False,
 ) -> tuple[np.ndarray, dict]:
     """Semantic RGB BEV image.
 
@@ -257,11 +263,22 @@ def make_semantic_bev(
     cells are black (0, 0, 0).
 
     When ``highlight_labels`` is provided the image switches to a two-tone
-    mode: cells whose label is in the set are drawn in coral-red, all other
+    mode: cells whose label is in the set are drawn in magenta, all other
     occupied cells are rendered in grayscale.
 
     When ``highlight_object_ids`` is provided, highlights those specific
-    object IDs in coral-red (takes precedence over ``highlight_labels``).
+    object IDs in magenta (takes precedence over ``highlight_labels``).
+
+    When ``semantic_background`` is True **and** a highlight set is active,
+    non-highlighted cells keep their NYU40 palette colour instead of being
+    flattened to grayscale — useful when you want an object-aware backdrop
+    under a density overlay.
+
+    When ``anchor_semantic_fill`` is True **and** ``highlight_object_ids`` is
+    given, the mode inverts: highlighted (anchor) cells are painted with
+    their NYU40 palette colour, and every other cell is drawn in per-label
+    grayscale. The magenta ``_HIGHLIGHT`` fill is not used in this mode —
+    callers that still want to mark anchors can overlay outlines separately.
 
     Returns:
         image: (H, W, 3) float32 RGB image.
@@ -281,15 +298,38 @@ def make_semantic_bev(
         v = 0.30 + (abs(hash(lbl)) % 256) / 256 * 0.42
         return np.array([v, v, v], dtype=np.float32)
 
+    def _semantic_or_gray(lbl: str, oid: int) -> np.ndarray:
+        """NYU40 palette colour with grayscale fallback if the label is missing."""
+        try:
+            return np.array(nyu40_to_color(lbl), dtype=np.float32)
+        except KeyError:
+            return _label_gray(lbl or str(oid))
+
+    def _background_color(lbl: str, oid: int) -> np.ndarray:
+        """Colour used for non-highlighted objects in highlight mode."""
+        if semantic_background:
+            return _semantic_or_gray(lbl, oid)
+        return _label_gray(lbl or str(oid))
+
     def _color_for(oid: int) -> np.ndarray:
         obj = id_to_obj.get(oid)
         if obj is None:
             return _GRAYSCALE
         lbl = _nyu40_label(obj)
         if highlight_object_ids is not None:
-            return _HIGHLIGHT if oid in highlight_object_ids else _label_gray(lbl or str(oid))
+            if anchor_semantic_fill:
+                return (
+                    _semantic_or_gray(lbl, oid) if oid in highlight_object_ids
+                    else _label_gray(lbl or str(oid))
+                )
+            return _HIGHLIGHT if oid in highlight_object_ids else _background_color(lbl, oid)
         if highlight_labels is not None:
-            return _HIGHLIGHT if lbl in highlight_labels else _label_gray(lbl)
+            if anchor_semantic_fill:
+                return (
+                    _semantic_or_gray(lbl, oid) if lbl in highlight_labels
+                    else _label_gray(lbl or str(oid))
+                )
+            return _HIGHLIGHT if lbl in highlight_labels else _background_color(lbl, oid)
         return np.array(nyu40_to_color(lbl), dtype=np.float32)
 
     id_to_color: dict[int, np.ndarray] = {
@@ -408,6 +448,8 @@ def render_bev(
     anchor_highlight: bool = False,
     highlight_object_ids: set[int] | None = None,
     show_target: bool = True,
+    semantic_background: bool = False,
+    anchor_semantic_fill: bool = False,
 ) -> plt.Figure:
     """Render a BEV figure from a SpatialQuery.
 
@@ -421,9 +463,9 @@ def render_bev(
         include_legend: Whether to draw the per-label colour legend.
         anchor_highlight: When True, renders all occupied cells in grayscale
             except objects sharing a semantic class with any anchor object,
-            which are drawn in coral-red.
+            which are drawn in magenta.
         highlight_object_ids: When provided, highlights these specific object
-            IDs in coral-red (takes precedence over anchor_highlight).
+            IDs in magenta (takes precedence over anchor_highlight).
         show_target: When False, suppresses the gold-star GT target marker.
 
     Returns:
@@ -462,6 +504,8 @@ def render_bev(
         resolution=resolution,
         highlight_labels=highlight_labels,
         highlight_object_ids=highlight_object_ids,
+        semantic_background=semantic_background,
+        anchor_semantic_fill=anchor_semantic_fill,
     )
     extent = [
         meta["x_min"],
@@ -557,6 +601,11 @@ def render_bev_with_sample_overlay(
     heatmap_alpha: float = 0.35,
     highlight_object_ids: set[int] | None = None,
     show_target: bool = True,
+    semantic_background: bool = False,
+    include_legend: bool = False,
+    anchor_highlight: bool | None = None,
+    background_alpha: float = 1.0,
+    anchor_semantic_fill: bool = False,
 ) -> plt.Figure:
     """Render the anchor-highlight BEV, then overlay a per-voxel sample-proportion grid.
 
@@ -580,14 +629,23 @@ def render_bev_with_sample_overlay(
     Returns:
         ``matplotlib.figure.Figure``
     """
+    if anchor_highlight is None:
+        anchor_highlight = highlight_object_ids is None
+
     fig = render_bev(
         query,
-        anchor_highlight=highlight_object_ids is None,
+        anchor_highlight=anchor_highlight,
         highlight_object_ids=highlight_object_ids,
         include_legend=False,
         show_target=show_target,
+        semantic_background=semantic_background,
+        anchor_semantic_fill=anchor_semantic_fill,
     )
     ax = fig.axes[0]
+
+    # Mute the semantic backdrop so the density overlay reads as primary.
+    if background_alpha < 1.0 and ax.images:
+        ax.images[0].set_alpha(background_alpha)
 
     x_min, x_max = ax.get_xlim()
     y_min, y_max = ax.get_ylim()
@@ -646,8 +704,232 @@ def render_bev_with_sample_overlay(
         zorder=4,  # above BEV image, below gold star (zorder=5)
     )
 
+    if include_legend:
+        _attach_density_and_markers_legend(
+            fig, ax,
+            log_min=_LOG_MIN,
+            log_max=_LOG_MAX,
+            heatmap_alpha=heatmap_alpha,
+            show_anchor=highlight_object_ids is not None and len(highlight_object_ids) > 0,
+            show_target=show_target,
+        )
+
     fig.tight_layout()
     return fig
+
+
+# ---------------------------------------------------------------------------
+# Structural anchor / GT-target / mode markers (GMM overlay)
+# ---------------------------------------------------------------------------
+
+def _object_xy_aabb(obj) -> tuple[float, float, float, float] | None:
+    """Axis-aligned XY bbox (x0, y0, x1, y1) from a scene-graph object.
+
+    Uses the 8-corner world-frame bbox if present, otherwise falls back to
+    a small square around ``obj.position``.
+    """
+    if obj.bbox is not None:
+        corners = np.asarray(obj.bbox, dtype=np.float32).reshape(-1, 3)
+        x0, x1 = float(corners[:, 0].min()), float(corners[:, 0].max())
+        y0, y1 = float(corners[:, 1].min()), float(corners[:, 1].max())
+        return x0, y0, x1, y1
+    pos = getattr(obj, "position", None)
+    if pos is None:
+        return None
+    px, py = float(pos[0]), float(pos[1])
+    return px - 0.15, py - 0.15, px + 0.15, py + 0.15
+
+
+def _draw_anchor_outlines(
+    ax: plt.Axes,
+    query: SpatialQuery,
+    anchor_object_ids: set[int],
+    color: np.ndarray | str = None,
+) -> None:
+    """Draw dashed outlines + small ``A{i}: {label}`` tags for each anchor.
+
+    Structural (outline-only) styling — avoids competing with the density
+    heatmap for attention.
+    """
+    if not anchor_object_ids:
+        return
+    color = _HIGHLIGHT if color is None else color
+    id_to_obj = {obj.id: obj for obj in query.scene_graph.objects}
+    for i, oid in enumerate(sorted(anchor_object_ids), start=1):
+        obj = id_to_obj.get(int(oid))
+        if obj is None:
+            continue
+        aabb = _object_xy_aabb(obj)
+        if aabb is None:
+            continue
+        x0, y0, x1, y1 = aabb
+        ax.add_patch(mpatches.Rectangle(
+            (x0, y0), x1 - x0, y1 - y0,
+            linewidth=1.6, edgecolor=color, facecolor="none",
+            linestyle="--", zorder=5,
+        ))
+        ax.text(
+            x0, y1,
+            f"A{i}: {obj.label or f'#{oid}'}",
+            fontsize=6.5, color=color, ha="left", va="bottom", zorder=6,
+            bbox=dict(
+                boxstyle="round,pad=0.15", fc="white",
+                ec=color, alpha=0.75, linewidth=0.5,
+            ),
+        )
+
+
+def _draw_gt_bullseye(
+    ax: plt.Axes,
+    x: float,
+    y: float,
+    outer_radius: float = 0.22,
+    inner_radius: float = 0.07,
+    crosshair_len: float = 0.32,
+) -> None:
+    """Bullseye marker for GT target: crosshair + outer ring + inner dot.
+
+    Chosen over a star because it reads as *measurement-like* and integrates
+    with the probabilistic density rather than competing with it.
+    """
+    ax.plot(
+        [x - crosshair_len, x + crosshair_len], [y, y],
+        color="black", linewidth=0.7, zorder=6, solid_capstyle="round",
+    )
+    ax.plot(
+        [x, x], [y - crosshair_len, y + crosshair_len],
+        color="black", linewidth=0.7, zorder=6, solid_capstyle="round",
+    )
+    ax.add_patch(mpatches.Circle(
+        (x, y), radius=outer_radius,
+        linewidth=1.3, edgecolor="black", facecolor="none", zorder=7,
+    ))
+    ax.add_patch(mpatches.Circle(
+        (x, y), radius=inner_radius,
+        linewidth=0.6, edgecolor="black", facecolor="white", zorder=8,
+    ))
+
+
+# ---------------------------------------------------------------------------
+# Density colorbar + anchor/target legend (used by the sample/GMM overlays)
+# ---------------------------------------------------------------------------
+
+class _BullseyeProxy:
+    """Sentinel handle used only to key into ``BullseyeHandler`` in a legend."""
+    pass
+
+
+class _BullseyeHandler:
+    """Custom legend handler that draws the GT bullseye (crosshair + ring + dot).
+
+    Matches ``_draw_gt_bullseye`` — otherwise the legend would misrepresent the
+    actual marker.
+    """
+
+    def legend_artist(self, legend, orig_handle, fontsize, handlebox):
+        from matplotlib.lines import Line2D
+        from matplotlib.patches import Circle
+
+        x0, y0 = handlebox.xdescent, handlebox.ydescent
+        w, h = handlebox.width, handlebox.height
+        cx = x0 + w / 2.0
+        cy = y0 + h / 2.0
+        r_out = min(w, h) * 0.35
+        r_in = min(w, h) * 0.12
+        r_cross = min(w, h) * 0.55
+
+        artists = [
+            Line2D([cx - r_cross, cx + r_cross], [cy, cy],
+                   color="black", linewidth=0.7, solid_capstyle="round"),
+            Line2D([cx, cx], [cy - r_cross, cy + r_cross],
+                   color="black", linewidth=0.7, solid_capstyle="round"),
+            Circle((cx, cy), radius=r_out,
+                   edgecolor="black", facecolor="none", linewidth=1.1),
+            Circle((cx, cy), radius=r_in,
+                   edgecolor="black", facecolor="white", linewidth=0.5),
+        ]
+        for a in artists:
+            handlebox.add_artist(a)
+        return artists[-1]
+
+
+def _attach_density_and_markers_legend(
+    fig: plt.Figure,
+    ax: plt.Axes,
+    *,
+    log_min: float,
+    log_max: float,
+    heatmap_alpha: float,
+    show_anchor: bool,
+    show_target: bool,
+    show_modes: bool = False,
+    anchor_style: str = "outline",   # "outline" (GMM overlay) | "fill" (legacy)
+    target_style: str = "bullseye",  # "bullseye" (GMM overlay) | "star" (legacy)
+) -> None:
+    """Add a density colorbar and a minimal marker legend to ``ax``.
+
+    The colorbar maps plasma values back to the underlying sample proportion
+    (the overlay normalises on log-scale, so the colorbar ticks are at fixed
+    proportions 1e-6 … 0.2).
+    """
+    from matplotlib import colors as mcolors
+    from matplotlib.cm import ScalarMappable
+    from matplotlib.lines import Line2D
+
+    # Density colorbar — tick at a handful of proportions that span log_min..log_max.
+    tick_props = [1e-6, 1e-4, 1e-3, 1e-2, 0.05, 0.2]
+    tick_norms = [
+        float(np.clip((np.log(p) - log_min) / (log_max - log_min), 0.0, 1.0))
+        for p in tick_props
+    ]
+    sm = ScalarMappable(norm=mcolors.Normalize(vmin=0.0, vmax=1.0), cmap=plt.cm.plasma)
+    sm.set_array([])
+    cbar = fig.colorbar(
+        sm, ax=ax, fraction=0.035, pad=0.02, shrink=0.75,
+        ticks=tick_norms, alpha=heatmap_alpha,
+    )
+    cbar.ax.set_yticklabels([f"{p:g}" for p in tick_props], fontsize=7)
+    cbar.set_label("density (sample proportion)", fontsize=8)
+    cbar.outline.set_linewidth(0.4)
+
+    handles: list = []
+    labels: list[str] = []
+    handler_map: dict = {}
+
+    if show_anchor:
+        if anchor_style == "outline":
+            handles.append(Line2D(
+                [0, 1], [0, 0], color=_HIGHLIGHT, linestyle="--", linewidth=1.6,
+            ))
+            labels.append("anchor bbox")
+        else:
+            handles.append(mpatches.Patch(color=_HIGHLIGHT))
+            labels.append("anchor object(s)")
+    if show_target:
+        if target_style == "bullseye":
+            proxy = _BullseyeProxy()
+            handles.append(proxy)
+            labels.append("GT location")
+            handler_map[_BullseyeProxy] = _BullseyeHandler()
+        else:
+            handles.append(Line2D(
+                [0], [0], marker="*", color="none", markerfacecolor="#FFD700",
+                markeredgecolor="black", markeredgewidth=0.8, markersize=12,
+            ))
+            labels.append("GT location")
+    if show_modes:
+        handles.append(Line2D(
+            [0], [0], marker="o", color="none",
+            markerfacecolor="white", markeredgecolor="black",
+            markeredgewidth=1.0, markersize=7,
+        ))
+        labels.append("GMM mode (size ∝ weight)")
+
+    if handles:
+        ax.legend(
+            handles=handles, labels=labels, loc="upper right", fontsize=7,
+            framealpha=0.85, ncol=1, handler_map=handler_map or None,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -663,75 +945,119 @@ def render_bev_with_gmm_overlay(
     show_component_means: bool = True,
     show_target: bool = False,
     seed: int = 42,
+    include_legend: bool = False,
+    background_alpha: float = 0.55,
+    full_color_backdrop: bool = False,
+    semantic_background: bool = True,  # kept for backward compat; ignored
 ) -> plt.Figure:
-    """Render BEV with a GMM density overlay and optional component markers.
+    """Render BEV with a GMM density overlay, structural anchor outlines,
+    and a bullseye GT marker.
 
-    Samples from the GMM and overlays the density, similar to
-    ``render_bev_with_sample_overlay`` but also marks each Gaussian
-    component mean with its weight.
+    Visual hierarchy (strongest → weakest):
 
-    The BEV highlights the hypothesized anchor objects from the GMM groundings
-    (not GT anchor labels).  The GT target marker is hidden by default; pass
-    ``show_target=True`` to display it when ground truth is available.
+        density heatmap ▸ GT bullseye + GMM modes ▸ anchor outlines ▸ backdrop.
+
+    Backdrop policy (default): anchor objects keep their NYU40 palette
+    colour to signal what drove the prediction; every other object is drawn
+    in per-label grayscale so the density stays dominant.  Pass
+    ``full_color_backdrop=True`` to fall back to the classic behaviour where
+    every object is painted by its NYU40 palette colour.  Anchors also
+    receive a dashed magenta outline and an ``A{i}: {label}`` tag in both
+    modes.  The GT location uses a crosshair + ring bullseye so it reads as
+    measurement-like rather than categorical.
 
     Args:
-        query:                SpatialQuery with point cloud data for BEV.
-        gmm_result:          :class:`GMMResult` from LanguageSpatialSensor.predict().
-        n_samples:           Number of samples drawn from the GMM for density.
-        resolution:          Voxel size in metres for the density overlay.
-        heatmap_alpha:       Opacity of density overlay.
-        show_component_means: Mark each Gaussian component with a labelled dot.
-        show_target:         Show the GT target gold-star marker (default False).
-        seed:                Random seed for deterministic sampling.
+        query:               SpatialQuery with point cloud data for BEV.
+        gmm_result:         :class:`GMMResult` from LanguageSpatialSensor.predict().
+        n_samples:          Samples drawn from the GMM for the density estimate.
+        resolution:         Voxel size in metres for the density overlay.
+        heatmap_alpha:      Opacity of the density overlay.
+        show_component_means: Mark each Gaussian component with a weight-sized circle.
+        show_target:        Draw the GT location bullseye marker.
+        seed:               Random seed for deterministic sampling.
+        include_legend:     Attach the density colorbar + anchor/GT/mode legend.
+        background_alpha:   Opacity of the semantic backdrop (<1 mutes it so the
+                            density overlay dominates the visual hierarchy).
+        full_color_backdrop: If True, paint every object by its NYU40 palette
+                            colour instead of the default grayscale-except-anchors
+                            backdrop.
+        semantic_background: Deprecated no-op kept for backward compatibility.
 
     Returns:
         ``matplotlib.figure.Figure``
     """
-    # Collect all hypothesized anchor object IDs from every grounding
+    del semantic_background  # always uses the anchor_semantic_fill backdrop now
     anchor_ids: set[int] = set()
     for g in gmm_result.groundings:
         anchor_ids.update(g.anchor_object_ids)
 
     samples_xyz = gmm_result.sample(n_samples, seed=seed)
+    # Backdrop: default = anchor cells keep NYU40 palette, rest go grayscale;
+    # full_color_backdrop = classic semantic palette everywhere.  We always
+    # draw our own structural anchor outlines + bullseye target afterwards,
+    # so the magenta fill-highlight is never enabled here.
     fig = render_bev_with_sample_overlay(
         query, samples_xyz,
         resolution=resolution,
         heatmap_alpha=heatmap_alpha,
-        highlight_object_ids=anchor_ids if anchor_ids else None,
-        show_target=show_target,
+        highlight_object_ids=(
+            None if full_color_backdrop else (anchor_ids if anchor_ids else None)
+        ),
+        show_target=False,
+        semantic_background=False,
+        include_legend=False,
+        anchor_highlight=False,
+        background_alpha=background_alpha,
+        anchor_semantic_fill=not full_color_backdrop,
     )
     ax = fig.axes[0]
 
+    _draw_anchor_outlines(ax, query, anchor_ids)
+
+    if show_target:
+        tx, ty = float(query.target_xyz[0]), float(query.target_xyz[1])
+        _draw_gt_bullseye(ax, tx, ty)
+
     if show_component_means:
-        mus = gmm_result.mus.numpy()    # (K, 3)
-        weights = gmm_result.weights.numpy()  # (K,)
-        cmap = plt.cm.Set1
+        mus = gmm_result.mus.numpy()           # (K, 3)
+        weights = gmm_result.weights.numpy()   # (K,)
         for k in range(len(weights)):
             mx, my = float(mus[k, 0]), float(mus[k, 1])
-            w = weights[k]
-            color = cmap(k % cmap.N)
+            w = float(weights[k])
             ax.plot(
                 mx, my, "o",
-                color=color,
-                markersize=8 + 12 * w,  # larger = higher weight
-                markeredgecolor="white",
-                markeredgewidth=1.2,
-                zorder=6,
+                markerfacecolor="white",
+                markeredgecolor="black",
+                markeredgewidth=1.0,
+                markersize=5 + 8 * w,  # modest range so high-w doesn't dominate
+                zorder=7,
             )
             ax.annotate(
-                f"w={w:.2f}",
+                f"{w:.2f}",
                 (mx, my),
                 textcoords="offset points",
-                xytext=(6, 6),
-                fontsize=7,
-                color=color,
-                fontweight="bold",
-                zorder=7,
+                xytext=(5, 5),
+                fontsize=6.5, color="black",
+                zorder=8,
                 bbox=dict(
-                    boxstyle="round,pad=0.15", fc="white", ec=color,
-                    alpha=0.7, linewidth=0.6,
+                    boxstyle="round,pad=0.12", fc="white", ec="black",
+                    alpha=0.8, linewidth=0.4,
                 ),
             )
+
+    if include_legend:
+        _EPS = 1e-8
+        _attach_density_and_markers_legend(
+            fig, ax,
+            log_min=float(np.log(_EPS)),
+            log_max=float(np.log(0.2)),
+            heatmap_alpha=heatmap_alpha,
+            show_anchor=bool(anchor_ids),
+            show_target=show_target,
+            show_modes=show_component_means,
+            anchor_style="outline",
+            target_style="bullseye",
+        )
 
     fig.tight_layout()
     return fig

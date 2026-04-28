@@ -16,6 +16,13 @@ VALID_REGION_LABELS: frozenset[str] = frozenset({
     "hall/stairwell",
     "garage",
     "rec room",
+    'livingroom',
+    'bedroom_1',
+    'bedroom_2',
+    'courtyard_1',
+    'courtyard_2',
+    'courtyard_3',
+    'courtyard_4',
 })
 
 VALID_RELATIONS: frozenset[str] = frozenset({
@@ -55,7 +62,7 @@ VALID_NYU40_LABELS: frozenset[str] = frozenset({
     "showercurtain",
     "box",
     "whiteboard",
-    "person",
+    # "person",
     "nightstand",
     "toilet",
     "sink",

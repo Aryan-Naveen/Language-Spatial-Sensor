@@ -133,6 +133,7 @@ Instructions:
 - referred_object_id must always be a list: one object id for single-object relations (e.g. "near the desk"), exactly two object ids for "between" (e.g. "between the desk and the wall" -> ["id1", "id2"]).
 - Use only objects present in the scene graph.
 - Confidence should reflect spatial plausibility and typical region layout priors.
+- Consider different rooms and object arrangements to generate diverse hypotheses.
 - Output format (referred_object_id is always a list; region_id is a single integer):
 
 {{
@@ -155,27 +156,35 @@ _K_DYNAMIC = (
 _FS_OFFICE_SCENE = """{
   "Office": {
     "objects": {
-      "0": {"semantics": "desk", "center": [0.0, -1.0, 0.4], "volume": 2.5, "object_id": "0"},
-      "1": {"semantics": "monitor", "center": [0.1, -1.0, 0.9], "volume": 0.04, "object_id": "1"},
-      "2": {"semantics": "keyboard", "center": [0.1, -0.85, 0.7], "volume": 0.003, "object_id": "2"},
-      "3": {"semantics": "chair", "center": [0.8, -0.6, 0.5], "volume": 0.3, "object_id": "3"},
-      "4": {"semantics": "wall", "center": [0.0, -2.5, 1.5], "volume": 6.0, "object_id": "4"},
-      "5": {"semantics": "chair", "center": [1.8, -1.6, 0.5], "volume": 0.3, "object_id": "5"}
+      "0": {"semantics": "desk", "raw_label": "wooden desk", "center": [0.0, -1.0, 0.4], "volume": 2.5, "object_id": "0"},
+      "1": {"semantics": "monitor", "raw_label": "computer monitor", "center": [0.1, -1.0, 0.9], "volume": 0.04, "object_id": "1"},
+      "2": {"semantics": "keyboard", "raw_label": "keyboard", "center": [0.1, -0.85, 0.7], "volume": 0.003, "object_id": "2"},
+      "3": {"semantics": "chair", "raw_label": "office chair", "center": [0.8, -0.6, 0.5], "volume": 0.3, "object_id": "3"},
+      "4": {"semantics": "wall", "raw_label": "wall", "center": [0.0, -2.5, 1.5], "volume": 6.0, "object_id": "4"},
+      "5": {"semantics": "chair", "raw_label": "folding chair", "center": [1.8, -1.6, 0.5], "volume": 0.3, "object_id": "5"}
     },
     "region_id": 0
+  },
+  "Lobby": {
+    "objects": {
+      "6": {"semantics": "sofa", "raw_label": "sofa", "center": [0.0, -1.0, 0.5], "volume": 1.0, "object_id": "6"},
+      "7": {"semantics": "table", "raw_label": "coffee table", "center": [0.0, -0.5, 0.3], "volume": 0.5, "object_id": "7"},
+      "8": {"semantics": "plant", "raw_label": "plant", "center": [0.0, -0.5, 0.8], "volume": 0.1, "object_id": "8"}
+    },
+    "region_id": 1
   }
 }"""
 
 _FS_BEDROOM_SCENE = """{
   "Bedroom": {
     "objects": {
-      "0": {"semantics": "nightstand", "center": [-0.8, -1.1, 0.6], "volume": 0.35, "object_id": "0"},
-      "1": {"semantics": "bed", "center": [0.0, -1.2, 0.5], "volume": 3.5, "object_id": "1"},
-      "2": {"semantics": "nightstand", "center": [0.8, -1.1, 0.6], "volume": 0.35, "object_id": "2"},
-      "3": {"semantics": "lamp", "center": [0.8, -1.1, 1.1], "volume": 0.05, "object_id": "3"},
-      "4": {"semantics": "dresser", "center": [-1.2, -0.4, 0.9], "volume": 1.8, "object_id": "4"},
-      "5": {"semantics": "chair", "center": [1.4, -0.3, 0.5], "volume": 0.35, "object_id": "5"},
-      "6": {"semantics": "window", "center": [0.0, -2.5, 1.4], "volume": 3.0, "object_id": "6"}
+      "0": {"semantics": "nightstand", "raw_label": "wooden nightstand", "center": [-0.8, -1.1, 0.6], "volume": 0.35, "object_id": "0"},
+      "1": {"semantics": "bed", "raw_label": "queen bed", "center": [0.0, -1.2, 0.5], "volume": 3.5, "object_id": "1"},
+      "2": {"semantics": "nightstand", "raw_label": "wooden nightstand", "center": [0.8, -1.1, 0.6], "volume": 0.35, "object_id": "2"},
+      "3": {"semantics": "lamp", "raw_label": "table lamp", "center": [0.8, -1.1, 1.1], "volume": 0.05, "object_id": "3"},
+      "4": {"semantics": "dresser", "raw_label": "dresser", "center": [-1.2, -0.4, 0.9], "volume": 1.8, "object_id": "4"},
+      "5": {"semantics": "chair", "raw_label": "armchair", "center": [1.4, -0.3, 0.5], "volume": 0.35, "object_id": "5"},
+      "6": {"semantics": "window", "raw_label": "window", "center": [0.0, -2.5, 1.4], "volume": 3.0, "object_id": "6"}
     },
     "region_id": 0
   }
@@ -188,7 +197,8 @@ _FS_USER_1 = _USER_TEMPLATE.format(
 )
 _FS_ASST_1 = """{
   "hypotheses": [
-    {"utterance": "there is a mouse on the desk", "referred_object_id": ["0"], "region_id": 0, "confidence": 1.0}
+    {"utterance": "there is a mouse on the desk", "referred_object_id": ["0"], "region_id": 0, "confidence": 0.8},
+    {"utterance": "there is a mouse on the table", "referred_object_id": ["7"], "region_id": 1, "confidence": 0.3}
   ]
 }"""
 
@@ -205,11 +215,32 @@ _FS_ASST_2 = """{
 }"""
 
 
+# Coarse nyu40 catch-all buckets — fall back to raw_label for these so
+# "otherprop" etc. don't collapse unrelated objects into one semantic bin.
+# Kept in sync with VLA3DDataset._semantic_label in data/vla3d/dataset.py
+# so the LLM sees the same label space the ambiguity score counts over.
+_NYU40_OTHER = {"otherprop", "otherfurniture", "otherstructure"}
+
+
+def _semantic_label(obj_metadata: dict) -> str:
+    """Match the label scheme used by the ambiguity metric.
+
+    Uses nyu40_label for most objects, falling back to raw_label for nyu40
+    catch-all buckets. Final fallback is raw_label then empty string.
+    """
+    nyu40 = obj_metadata.get("nyu40_label") or ""
+    if nyu40 in _NYU40_OTHER:
+        return obj_metadata.get("raw_label") or nyu40
+    return nyu40 or obj_metadata.get("raw_label") or ""
+
+
 def _scene_graph_to_json(sg: SceneGraph) -> str:
     """Serialize a SceneGraph into JSON for the LLM prompt.
 
     Groups objects by region and includes semantics, center, volume, and
     object_id — matching the format used in the few-shot examples.
+    The ``semantics`` field is the nyu40 label so it's consistent with the
+    label space the ambiguity metric counts over.
     """
     import numpy as np
 
@@ -232,8 +263,11 @@ def _scene_graph_to_json(sg: SceneGraph) -> str:
                 corners = np.array(obj.bbox, dtype=np.float32).reshape(8, 3)
                 size = corners.max(axis=0) - corners.min(axis=0)
                 vol = float(np.prod(size))
+            sem = _semantic_label(obj.metadata) or obj.label
+            raw = obj.metadata.get("raw_label") or obj.label
             obj_map[str(obj.id)] = {
-                "semantics": obj.label,
+                "semantics": sem,
+                "raw_label": raw,
                 "center": center,
                 "volume": round(float(vol), 3) if vol else 0.0,
                 "object_id": str(obj.id),
@@ -273,6 +307,7 @@ def _parse_llm_response(text: str) -> list[dict[str, Any]]:
             if isinstance(ref_ids, (str, int)):
                 ref_ids = [ref_ids]
             out.append({
+                "utterance": str(h.get("utterance", "")).strip(),
                 "referred_object_id": [str(x) for x in ref_ids],
                 "region_id": int(h.get("region_id", 0)),
                 "confidence": float(h.get("confidence", 0.5)),
@@ -312,7 +347,7 @@ class LLMProposer(Proposer):
         model: str = "qwen2.5:32b",
         base_url: str | None = None,
         api_key: str | None = None,
-        temperature: float = 0.0,
+        temperature: float | None = None,
         cache_dir: str | None = None,
         seed: int = 42,
         verbose: bool = False,
@@ -363,8 +398,9 @@ class LLMProposer(Proposer):
         kwargs: dict[str, Any] = {
             "model": self._model,
             "messages": messages,
-            "temperature": self._temperature,
         }
+        if self._temperature is not None:
+            kwargs["temperature"] = self._temperature
         if self._seed is not None and self._provider == "openai":
             kwargs["seed"] = self._seed
 
@@ -430,10 +466,11 @@ class LLMProposer(Proposer):
             region_id = h.get("region_id", 0)
             if ref_ids:
                 region_id = obj_to_region.get(ref_ids[0], region_id)
+            rewritten = h.get("utterance", "").strip()
             groundings.append(Grounding(
                 anchor_room_id=region_id,
                 anchor_object_ids=ref_ids,
-                language=utterance,
+                language=rewritten or utterance,
                 confidence=h.get("confidence", 0.5),
             ))
 

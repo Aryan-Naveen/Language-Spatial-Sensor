@@ -18,21 +18,27 @@ class LSSConfig:
     # ── Dimensions ────────────────────────────────────────────────────────────
     hidden_dim: int = 256        # shared D across all transformer layers
     clip_dim: int = 512          # CLIP ViT-B/32 output dim (frozen)
-    bert_dim: int = 768          # BERT base hidden dim
+    bert_dim: int = 768          # unused: TextEncoder reads hidden_size from the loaded HF model
 
     # ── Text encoder ──────────────────────────────────────────────────────────
     text_model: str = "bert-base-uncased"
     freeze_text: bool = False    # fine-tune BERT by default
 
     # ── Spatial relation MLP ──────────────────────────────────────────────────
-    # calc_pairwise_locs output last dim must match: mlp → 12; center/vertical_bottom → 1, 4, or 5.
+    # calc_pairwise_locs output last dim must match:
+    #   mlp               → 12
+    #   center/vertical_bottom → 1, 4, or 5
+    #   topological       → 7   (3D IoU, vertical support, surface gaps)
+    #   geometric_algebra → 7   (vector 3 + bivector 3 + trivector 1)
     spatial_relation_dim: int = 12
     spatial_mlp_hidden: int = 64     # hidden dim of the relation projection MLP
-    pairwise_rel_type: str = "mlp"  # "mlp" | "center" | "vertical_bottom"
+    pairwise_rel_type: str = "mlp"  # "mlp" | "center" | "vertical_bottom" | "topological" | "geometric_algebra"
     spatial_pairwise_dist_norm: bool = True  # ignored when pairwise_rel_type == "mlp"
-    # Language-conditioned spatial bias: FiLM the spatial-MLP hidden layer with text CLS.
+    # Language-conditioned spatial bias: condition the spatial-MLP hidden layer on text CLS.
     # Lets the pairwise bias depend on the query (e.g. "above" up-weights vertical pairs).
     condition_spatial_on_text: bool = False
+    # How to condition: "film" (affine γ,β), "gate" (sigmoid), "film_gate" (both).
+    spatial_conditioning_type: str = "film"
 
     # ── Anchor-centric object embedding ──────────────────────────────────────
     # Inject per-object (centre − anchor-centroid) delta as an additive hidden embedding.

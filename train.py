@@ -33,8 +33,14 @@ import hydra
 import numpy as np
 import torch
 import torch.nn as nn
-import wandb
 from omegaconf import DictConfig, OmegaConf
+
+# wandb is optional — the sweep disables it, and the container image skips
+# the install to keep start-up fast. All call sites guard with `wandb is not None`.
+try:
+    import wandb
+except ImportError:
+    wandb = None
 from torch.cuda.amp import GradScaler
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -63,7 +69,12 @@ from language_spatial_sensor.pipeline.augmentations import (
     RandomObjectJitter,
     RandomSceneRotation,
 )
-from language_spatial_sensor.training.dataset import CachedLSSDataset, CollateFn
+from language_spatial_sensor.training.dataset import (
+    CachedLSSDataset,
+    CollateFn,
+    ShardedLSSDataset,
+    is_sharded_cache,
+)
 from viz.bev import render_bev_with_sample_overlay
 
 
@@ -160,8 +171,11 @@ def evaluate(
     all_marginal_sigma: list[torch.Tensor] = []
 
     conformal = getattr(tr, "conformal_superset", False)
+    max_val_steps = int(getattr(tr, "max_val_steps", 0) or 0)
 
-    for batch in loader:
+    for step, batch in enumerate(loader):
+        if max_val_steps > 0 and step >= max_val_steps:
+            break
         batch = _to_device(batch, device)
         with torch.autocast(device_type=device.type, dtype=autocast_dtype):
             pred: GaussianPrediction = _forward(model, batch)
@@ -465,13 +479,31 @@ def run_training(cfg: DictConfig, trial=None) -> float:
     cache_dir  = Path(cfg.cache.dir)
     train_augs = build_augmentations(cfg.augmentation)
 
-    train_ds    = CachedLSSDataset(cache_dir / "train",     augmentations=train_augs)
-    val_seen_ds = CachedLSSDataset(cache_dir / "val_seen",  augmentations=None)
+    # Auto-detect shard layout: tar shards stream ~1000× faster than per-sample
+    # .pt files over FastFile. Map-style .pt path stays for local runs that
+    # need random access (e.g. BEV viz).
+    use_shards = is_sharded_cache(cache_dir / "train")
+    print(f"[data] cache format: {'tar-shards' if use_shards else 'per-sample .pt'}", flush=True)
+
+    if use_shards:
+        train_ds = ShardedLSSDataset(
+            cache_dir / "train",
+            augmentations=train_augs,
+            shuffle_buffer=8000,   # ~8 shards of mixing
+            shardshuffle=True,
+        )
+        val_seen_ds = ShardedLSSDataset(cache_dir / "val_seen", augmentations=None)
+    else:
+        train_ds    = CachedLSSDataset(cache_dir / "train",     augmentations=train_augs)
+        val_seen_ds = CachedLSSDataset(cache_dir / "val_seen",  augmentations=None)
 
     # val_unseen is optional — skip gracefully if the split doesn't exist yet
-    val_unseen_ds: CachedLSSDataset | None = None
+    val_unseen_ds: CachedLSSDataset | ShardedLSSDataset | None = None
     try:
-        val_unseen_ds = CachedLSSDataset(cache_dir / "val_unseen", augmentations=None)
+        if use_shards:
+            val_unseen_ds = ShardedLSSDataset(cache_dir / "val_unseen", augmentations=None)
+        else:
+            val_unseen_ds = CachedLSSDataset(cache_dir / "val_unseen", augmentations=None)
     except FileNotFoundError:
         print("[warn] val_unseen split not found — skipping unseen evaluation.")
 
@@ -480,18 +512,21 @@ def run_training(cfg: DictConfig, trial=None) -> float:
         max_text_len=cfg.model.max_text_len,
     )
 
+    # IterableDataset forbids shuffle=True; shuffle happens inside the
+    # dataset (shard-level + in-worker buffer).
     train_loader = DataLoader(
         train_ds,
         batch_size=tr.batch_size,
-        shuffle=True,
+        shuffle=False if use_shards else True,
         num_workers=tr.num_workers,
         collate_fn=collate_fn,
         pin_memory=(device.type == "cuda"),
         persistent_workers=(tr.num_workers > 0),
+        drop_last=True,
     )
     val_loader = DataLoader(
         val_seen_ds,
-        batch_size=tr.batch_size * 2,
+        batch_size=tr.batch_size,
         shuffle=False,
         num_workers=tr.num_workers,
         collate_fn=collate_fn,
@@ -502,7 +537,7 @@ def run_training(cfg: DictConfig, trial=None) -> float:
     if val_unseen_ds is not None:
         val_unseen_loader = DataLoader(
             val_unseen_ds,
-            batch_size=tr.batch_size * 2,
+            batch_size=tr.batch_size,
             shuffle=False,
             num_workers=tr.num_workers,
             collate_fn=collate_fn,
@@ -513,9 +548,17 @@ def run_training(cfg: DictConfig, trial=None) -> float:
     # ── Model ──────────────────────────────────────────────────────────────────
     model = build_model(cfg.model).to(device)
 
-    # torch.compile for additional fusion / kernel optimisation
-    if device.type == "cuda" and hasattr(torch, "compile"):
-        model = torch.compile(model)
+    # torch.compile for additional fusion / kernel optimisation.
+    # Disabled via `training.disable_compile=True` for Optuna sweeps: running
+    # many varied model topologies + text backbones through torch.compile in a
+    # single process accumulates inductor/CUDA state and eventually SIGSEGVs
+    # inside a plain Linear forward after a few trials.
+    if (
+        device.type == "cuda"
+        and hasattr(torch, "compile")
+        and not bool(getattr(tr, "disable_compile", False))
+    ):
+        model = torch.compile(model, dynamic=False)
 
     # ── Optimiser + scheduler ─────────────────────────────────────────────────
     optimizer = build_optimizer(model, tr)
@@ -547,12 +590,24 @@ def run_training(cfg: DictConfig, trial=None) -> float:
     global_step   = 0
 
     # ── Training epochs ────────────────────────────────────────────────────────
+    max_train_steps = int(getattr(tr, "max_train_steps_per_epoch", 0) or 0)
+    full_len = len(train_loader)
+    pbar_total = min(max_train_steps, full_len) if max_train_steps > 0 else full_len
     for epoch in range(1, tr.epochs + 1):
         model.train()
         epoch_loss = 0.0
+        epoch_step = 0
 
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{tr.epochs}", leave=False)
+        pbar = tqdm(
+            train_loader,
+            desc=f"Epoch {epoch}/{tr.epochs}",
+            leave=False,
+            total=pbar_total,
+        )
         for batch in pbar:
+            if max_train_steps > 0 and epoch_step >= max_train_steps:
+                break
+            epoch_step += 1
             batch = _to_device(batch, device)
 
             with torch.autocast(device_type=device.type, dtype=autocast_dtype):
@@ -584,7 +639,8 @@ def run_training(cfg: DictConfig, trial=None) -> float:
                     "step":          global_step,
                 })
 
-        avg_train_loss = epoch_loss / max(len(train_loader), 1)
+        steps_this_epoch = epoch_step if max_train_steps > 0 else len(train_loader)
+        avg_train_loss = epoch_loss / max(steps_this_epoch, 1)
 
         # ── Validation ─────────────────────────────────────────────────────────
         if epoch % tr.val_every == 0:
@@ -656,7 +712,9 @@ def run_training(cfg: DictConfig, trial=None) -> float:
                 wandb.log(log_dict)
 
             # ── BEV visualisation (val_seen only) ───────────────────────────
-            if epoch % cfg.viz.plot_every == 0:
+            # generate_bev_plots random-indexes the dataset — only map-style
+            # CachedLSSDataset supports that. Sharded runs skip viz silently.
+            if epoch % cfg.viz.plot_every == 0 and not use_shards:
                 figs = generate_bev_plots(
                     model, val_seen_ds, collate_fn, device, autocast_dtype,
                     n_scenes=cfg.viz.n_scenes,
@@ -693,6 +751,24 @@ def run_training(cfg: DictConfig, trial=None) -> float:
             if trial is not None:
                 import optuna
                 trial.report(val_loss, step=epoch)
+                # Persist per-epoch metrics to the DB as user attrs. W&B is
+                # disabled during sweeps, so without this the train-loss curve
+                # is only in CloudWatch logs and vanishes with the container.
+                # Append to a list so `trial.user_attrs["train_loss_curve"]`
+                # becomes the full per-epoch history.
+                train_curve = list(trial.user_attrs.get("train_loss_curve", []))
+                train_curve.append(float(avg_train_loss))
+                trial.set_user_attr("train_loss_curve", train_curve)
+
+                val_curve = list(trial.user_attrs.get("val_loss_curve", []))
+                val_curve.append(float(val_loss))
+                trial.set_user_attr("val_loss_curve", val_curve)
+
+                if val_unseen_metrics is not None:
+                    val_unseen_curve = list(trial.user_attrs.get("val_unseen_loss_curve", []))
+                    val_unseen_curve.append(float(val_unseen_metrics["loss"]))
+                    trial.set_user_attr("val_unseen_loss_curve", val_unseen_curve)
+
                 if trial.should_prune():
                     if use_wandb:
                         wandb.finish()
@@ -714,6 +790,10 @@ def run_training(cfg: DictConfig, trial=None) -> float:
 
     if use_wandb:
         wandb.finish()
+
+    report_to = OmegaConf.select(cfg, "report_to", default=None)
+    if report_to:
+        Path(report_to).write_text(f"{float(best_val_loss)}\n")
 
     return best_val_loss
 

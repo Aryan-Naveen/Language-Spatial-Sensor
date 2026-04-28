@@ -5,7 +5,7 @@ defaults:
 
 # ── Training hyperparameters ──────────────────────────────────────────────────
 training:
-  epochs: 25
+  epochs: 50
   batch_size: 256
   # Learning rate — BERT params use lr * bert_lr_scale
   lr: 1.0e-4
@@ -37,6 +37,18 @@ training:
   # Conformal prediction metrics (validation only)
   conformal_superset: false
   conformal_coverage: 0.9
+  # Subset-per-epoch caps — used for cheap architecture-search sweeps.
+  # 0 = no cap (full epoch). For a Stage-1 sweep targeting ~30 s/epoch on a
+  # single local GPU, set e.g. max_train_steps_per_epoch=500, max_val_steps=50.
+  max_train_steps_per_epoch: 0
+  max_val_steps: 0
+  # Skip torch.compile — used by Optuna sweeps that run many varied model
+  # topologies in one process (compiling across trials corrupts inductor state).
+  disable_compile: false
+
+# Path to write best_val_loss to at end of run_training. null = no report file.
+# Used by the subprocess-per-trial Optuna sweep to retrieve trial results.
+report_to: null
 
 # ── Cache ─────────────────────────────────────────────────────────────────────
 cache:

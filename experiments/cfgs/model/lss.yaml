@@ -11,13 +11,16 @@ text_model: bert-base-uncased
 freeze_text: true        # fine-tune BERT; set true to freeze for faster runs
 
 # ── Spatial relation MLP ──────────────────────────────────────────────────────
-spatial_relation_dim: 12  # mlp: 6+6 concat; center/vertical_bottom: 1, 4, or 5
+# spatial_relation_dim must match pairwise_rel_type:
+#   mlp → 12  |  center/vertical_bottom → 1, 4, or 5  |  topological/geometric_algebra → 7
+spatial_relation_dim: 12
 spatial_mlp_hidden: 64
-pairwise_rel_type: mlp         # mlp | center | vertical_bottom
-spatial_pairwise_dist_norm: true   # unused for mlp
-# FiLM the spatial-MLP hidden layer on text CLS so the bias depends on the query
-# (e.g. "above" can up-weight vertical pairs).
+pairwise_rel_type: mlp         # mlp | center | vertical_bottom | topological | geometric_algebra
+spatial_pairwise_dist_norm: true   # unused for mlp / topological / geometric_algebra
+# Condition the spatial-MLP hidden layer on text CLS so the bias depends on the
+# query (e.g. "above" can up-weight vertical pairs).
 condition_spatial_on_text: true
+spatial_conditioning_type: film    # film | gate | film_gate
 
 # ── Anchor-centric coordinates ────────────────────────────────────────────────
 # Add an additive (centre − anchor-centroid) embedding to each object feature.

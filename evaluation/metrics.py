@@ -1,7 +1,7 @@
 """Metrics for evaluating the Language Spatial Sensor pipeline.
 
 Provides both proposer-level metrics (anchor precision / recall) and
-end-to-end distribution metrics (CDF, RMSE, NLL, ECE).  All functions
+end-to-end distribution metrics (CDF, RMSE, NLL, ANEES).  All functions
 accept lists so they can be vectorised or grouped by relation / ambiguity.
 """
 
@@ -34,8 +34,10 @@ def proposer_precision_recall(
 
     Returns overall averages and per-ambiguity-level breakdowns.
     """
+    from evaluation.benchmark import ambiguity_sort_key
+
     precisions, recalls = [], []
-    ambiguities: list[int] = []
+    ambiguities: list[Any] = []
     num_proposed: list[int] = []
 
     for gs, q in zip(groundings_per_query, queries):
@@ -49,8 +51,11 @@ def proposer_precision_recall(
         recalls.append(rec)
         num_proposed.append(len(proposed_ids))
 
+        # Preserve whatever bucket label the driver attached (int for raw
+        # ambiguity integers, or bucket strings like "5+" from
+        # run_benchmark_ambig).
         ambiguity = q.metadata.get("ambiguity", 0) if q.metadata else 0
-        ambiguities.append(int(ambiguity))
+        ambiguities.append(ambiguity)
 
     out: dict[str, Any] = {
         "proposer_precision": float(np.mean(precisions)),
@@ -59,11 +64,11 @@ def proposer_precision_recall(
         "n": len(queries),
     }
 
-    # Per-ambiguity breakdown
-    by_level: dict[int, list[int]] = defaultdict(list)
+    # Per-ambiguity breakdown — key type is whatever the driver used.
+    by_level: dict[Any, list[int]] = defaultdict(list)
     for i, level in enumerate(ambiguities):
         by_level[level].append(i)
-    for level in sorted(by_level):
+    for level in sorted(by_level, key=ambiguity_sort_key):
         idx = by_level[level]
         out[f"proposer_precision_ambig_{level}"] = float(np.mean([precisions[i] for i in idx]))
         out[f"proposer_recall_ambig_{level}"] = float(np.mean([recalls[i] for i in idx]))
@@ -125,29 +130,142 @@ def gmm_nll_at_gt(
     return nlls
 
 
-def gmm_ece(
-    cdfs: list[float],
-    in_bbox: list[bool],
-    n_bins: int = 10,
-) -> float:
-    """Expected Calibration Error.
+def gmm_nees(
+    results: list[GMMResult],
+    queries: list[SpatialQuery],
+) -> list[float]:
+    """Per-query Normalised Estimation Error Squared under the moment-matched
+    mixture Gaussian.
 
-    Bins samples by their predicted CDF value and compares the average
-    predicted mass to the actual fraction of samples where the GT falls
-    inside the predicted high-density region.
+    The full mixture — Gaussian components **plus the conformal uniform tail
+    if present** — is collapsed to a single effective Gaussian
+    ``N(μ_mix, Σ_mix)`` via the law of total (co)variance::
+
+        μ_mix = Σ_k w̃_k μ_k  + α μ_e
+        Σ_mix = Σ_k w̃_k (Σ_k + (μ_k - μ_mix)(μ_k - μ_mix)ᵀ)
+              + α  ((q²/5) Σ_e + (μ_e - μ_mix)(μ_e - μ_mix)ᵀ)
+
+    where ``w̃_k = (1-α) w_k`` and ``α = conformal.weight``; ``Σ_k = L_k L_kᵀ``
+    and ``Σ_e = L_e L_eᵀ``. Without a conformal tail (α = 0) this reduces to
+    the plain GMM moment match.
+
+    The uniform tail's (q²/5) Σ_e factor comes from the covariance of a
+    uniform distribution over a 3D ball scaled into the Mahalanobis ellipsoid.
+
+    NEES for one query is ``(x - μ_mix)ᵀ Σ_mix⁻¹ (x - μ_mix)``. The average
+    across queries (ANEES) is the calibration diagnostic: for a well-calibrated
+    3D predictor ANEES ≈ 3 (>3 = over-confident, <3 = under-confident).
+    Adding a conformal tail inflates Σ_mix, so ANEES drops toward 3.
     """
-    cdfs_arr = np.array(cdfs)
-    acc_arr = np.array(in_bbox, dtype=float)
-    bin_edges = np.linspace(0, 1, n_bins + 1)
-    ece = 0.0
-    for lo, hi in zip(bin_edges[:-1], bin_edges[1:]):
-        mask = (cdfs_arr >= lo) & (cdfs_arr < hi)
-        if not mask.any():
-            continue
-        avg_conf = cdfs_arr[mask].mean()
-        avg_acc = acc_arr[mask].mean()
-        ece += mask.sum() / len(cdfs_arr) * abs(avg_acc - avg_conf)
-    return float(ece)
+    nees_list: list[float] = []
+    for r, q in zip(results, queries):
+        w = r.weights.to(torch.float64)                       # (K,)
+        mus = r.mus.to(torch.float64)                         # (K, 3)
+        Ls = r.Ls.to(torch.float64)                           # (K, 3, 3)
+        sigmas = Ls @ Ls.transpose(-2, -1)                    # (K, 3, 3)
+
+        alpha = float(r.conformal.weight) if r.conformal is not None else 0.0
+        w_tilde = (1.0 - alpha) * w                           # (K,)
+
+        mu_mix = (w_tilde.unsqueeze(-1) * mus).sum(0)         # (3,)
+        if r.conformal is not None:
+            mu_e = r.conformal.mu.to(torch.float64)
+            mu_mix = mu_mix + alpha * mu_e
+
+        diff = mus - mu_mix                                   # (K, 3)
+        outer = diff.unsqueeze(-1) @ diff.unsqueeze(-2)       # (K, 3, 3)
+        sigma_mix = (w_tilde.view(-1, 1, 1) * (sigmas + outer)).sum(0)  # (3, 3)
+
+        if r.conformal is not None:
+            L_e = r.conformal.L.to(torch.float64)
+            q_val = float(r.conformal.q)
+            sigma_e = L_e @ L_e.T
+            diff_e = (mu_e - mu_mix).unsqueeze(-1)             # (3, 1)
+            sigma_mix = sigma_mix + alpha * (
+                (q_val ** 2 / 5.0) * sigma_e
+                + diff_e @ diff_e.T
+            )
+
+        target = torch.as_tensor(q.target_xyz, dtype=torch.float64)
+        delta = target - mu_mix
+
+        try:
+            sol = torch.linalg.solve(sigma_mix, delta)
+        except torch._C._LinAlgError:
+            sol = torch.linalg.pinv(sigma_mix) @ delta
+        nees_list.append(float(delta @ sol))
+    return nees_list
+
+
+# ---------------------------------------------------------------------------
+# Component-wise NEES (mode-aware — preferred for ambiguous / multi-modal)
+# ---------------------------------------------------------------------------
+
+def _component_nees(r: GMMResult, target_xyz: np.ndarray) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-component NEES and normalised weights for a single query.
+
+    Returns:
+        ``(eps, w)`` where ``eps[k] = (x* − μ_k)ᵀ Σ_k⁻¹ (x* − μ_k)`` and
+        ``w`` is the K-vector of renormalised component weights (sums to 1).
+
+    The conformal uniform tail is intentionally ignored — it has no component
+    centre, and ``run_benchmark_ambig`` does not use conformal approaches.
+    """
+    mus = r.mus.to(torch.float64)                  # (K, 3)
+    Ls = r.Ls.to(torch.float64)                    # (K, 3, 3)
+    w = r.weights.to(torch.float64)                # (K,)
+    target = torch.as_tensor(target_xyz, dtype=torch.float64)
+    diff = target.unsqueeze(0) - mus               # (K, 3)
+
+    # Solve L_k L_kᵀ z = diff_k with two triangular solves per component.
+    #   y_k = L_k⁻¹ diff_k          (forward substitution)
+    #   z_k = L_kᵀ⁻¹ y_k            (back substitution)
+    # Then ε_k = diffᵀ z = yᵀ y.
+    y = torch.linalg.solve_triangular(
+        Ls, diff.unsqueeze(-1), upper=False,
+    ).squeeze(-1)                                  # (K, 3)
+    eps = (y * y).sum(dim=-1)                      # (K,)
+
+    w_sum = float(w.sum())
+    w_norm = w / w_sum if w_sum > 0 else torch.full_like(w, 1.0 / len(w))
+    return eps, w_norm
+
+
+def gmm_nees_min(
+    results: list[GMMResult],
+    queries: list[SpatialQuery],
+) -> list[float]:
+    """Per-query **minimum** component NEES: ``ε = min_k ε_k``.
+
+    "Best matching mode" — measures how close the GT is to whichever
+    component explains it best.  Useful in the ambiguous setting where a
+    good multi-modal prediction should have *at least one* well-calibrated
+    component near the GT, even if the others are far away.  Loses the
+    clean χ² reference of moment-matched ANEES, but preserves multimodality.
+    """
+    vals: list[float] = []
+    for r, q in zip(results, queries):
+        eps, _ = _component_nees(r, q.target_xyz)
+        vals.append(float(eps.min()))
+    return vals
+
+
+def gmm_nees_weighted(
+    results: list[GMMResult],
+    queries: list[SpatialQuery],
+) -> list[float]:
+    """Per-query **weight-averaged** component NEES: ``ε = Σ_k w_k ε_k``.
+
+    Penalises components that put mass far from the GT in proportion to
+    their weight.  Sits between moment-matched ANEES (single-Gaussian
+    collapse) and min-NEES (best-mode only) — it keeps the full mixture's
+    weight structure without discarding bad modes.
+    """
+    vals: list[float] = []
+    for r, q in zip(results, queries):
+        eps, w = _component_nees(r, q.target_xyz)
+        vals.append(float((w * eps).sum()))
+    return vals
 
 
 # ---------------------------------------------------------------------------
@@ -189,13 +307,17 @@ def compute_all_metrics(
     """Compute all end-to-end metrics and group by relation / ambiguity.
 
     Returns a nested dict with keys:
-        - ``overall``: aggregate metrics
+        - ``overall``: aggregate metrics (includes ``anees`` — target ≈ 3 for
+          a well-calibrated 3D predictor)
         - ``by_relation``: per-relation breakdowns
         - ``by_ambiguity``: per-ambiguity breakdowns
     """
     cdfs = gmm_cdf_at_gt(results, queries)
     rmses = gmm_rmse(results, queries)
     nlls = gmm_nll_at_gt(results, queries)
+    nees = gmm_nees(results, queries)
+    nees_min = gmm_nees_min(results, queries)
+    nees_w = gmm_nees_weighted(results, queries)
 
     # Whether GMM mean falls inside GT bbox
     in_bbox = []
@@ -211,40 +333,57 @@ def compute_all_metrics(
             inside = float(np.linalg.norm(mu - q.target_xyz)) < 0.2
         in_bbox.append(inside)
 
-    ece = gmm_ece(cdfs, in_bbox)
-
     relations = [q.metadata.get("relation", "unknown") for q in queries]
     ambiguities = [q.metadata.get("ambiguity", 0) for q in queries]
 
     nll_q25, nll_q75 = np.percentile(nlls, [25, 75]) if nlls else (0.0, 0.0)
+    # ANEES is by definition mean(NEES); std/median are over the per-query
+    # NEES distribution, not "std of ANEES".
     overall = {
         "cdf_mean": float(np.mean(cdfs)),
         "cdf_median": float(np.median(cdfs)),
         "rmse_mean": float(np.mean(rmses)),
+        "rmse_std": float(np.std(rmses)) if rmses else 0.0,
         "rmse_median": float(np.median(rmses)),
         "nll_mean": float(np.mean(nlls)),
+        "nll_std": float(np.std(nlls)) if nlls else 0.0,
         "nll_median": float(np.median(nlls)) if nlls else 0.0,
         "nll_q25": float(nll_q25),
         "nll_q75": float(nll_q75),
         "nll_iqr": float(nll_q75 - nll_q25),
         "accuracy": float(np.mean(in_bbox)),
-        "ece": ece,
+        "anees": float(np.mean(nees)) if nees else 0.0,
+        "nees_std": float(np.std(nees)) if nees else 0.0,
+        "nees_median": float(np.median(nees)) if nees else 0.0,
+        # Component-wise (mode-aware) variants — used by the ambiguity table.
+        # ANEES_min is reported as median + IQR: its distribution is heavily
+        # right-skewed (a single wrong mode can blow up the mean), so mean is
+        # not representative. Median/IQR reflect the typical-query calibration.
+        "anees_min": float(np.mean(nees_min)) if nees_min else 0.0,
+        "nees_min_std": float(np.std(nees_min)) if nees_min else 0.0,
+        "nees_min_median": float(np.median(nees_min)) if nees_min else 0.0,
+        "nees_min_q25": float(np.percentile(nees_min, 25)) if nees_min else 0.0,
+        "nees_min_q75": float(np.percentile(nees_min, 75)) if nees_min else 0.0,
+        "nees_min_iqr": (
+            float(np.percentile(nees_min, 75) - np.percentile(nees_min, 25))
+            if nees_min else 0.0
+        ),
+        "anees_w": float(np.mean(nees_w)) if nees_w else 0.0,
+        "nees_w_std": float(np.std(nees_w)) if nees_w else 0.0,
         "n": len(queries),
     }
 
+    per_query_items = [
+        ("cdf", cdfs), ("rmse", rmses), ("nll", nlls),
+        ("nees", nees), ("nees_min", nees_min), ("nees_w", nees_w),
+    ]
     return {
         "overall": overall,
-        "per_query": {
-            "cdf": list(cdfs),
-            "rmse": list(rmses),
-            "nll": list(nlls),
-        },
+        "per_query": {name: list(vals) for name, vals in per_query_items},
         "by_relation": {
-            metric: _group_metric(vals, relations)
-            for metric, vals in [("cdf", cdfs), ("rmse", rmses), ("nll", nlls)]
+            name: _group_metric(vals, relations) for name, vals in per_query_items
         },
         "by_ambiguity": {
-            metric: _group_metric(vals, ambiguities)
-            for metric, vals in [("cdf", cdfs), ("rmse", rmses), ("nll", nlls)]
+            name: _group_metric(vals, ambiguities) for name, vals in per_query_items
         },
     }

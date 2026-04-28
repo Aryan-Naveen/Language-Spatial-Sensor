@@ -2,7 +2,7 @@
 
 # Preprocessed dataset cache (built by scripts/preprocess.py — can be large)
 cache/
-
+results/
 # Model checkpoints and raw tensor files
 checkpoints/
 *.pt
@@ -227,3 +227,5 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+cache_shards/
