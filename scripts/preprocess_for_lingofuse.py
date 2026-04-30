@@ -13,12 +13,17 @@ Output layout:
 
 Usage:
     python scripts/preprocess_for_lingofuse.py \\
-        --data_root /path/to/VLA-3D/Matterport \\
-        --output_dir /path/to/lingofuse/data/episodes \\
+        --data_root /path/to/lingofuse/data \\
+        --scene_ids 17DRP5sb8fy \\
+        --output_dir /path/to/lingofuse/data/17DRP5sb8fy/episodes \\
         --ambiguity_min 0 --ambiguity_max 5 \\
         --target_labels chair sofa lamp \\
         --n_samples 50 \\
         --seed 42
+
+Note: --output_dir should point to the scene's episodes/ subdirectory.
+The script writes <scene_id>/<episode_id>/ inside that directory,
+which matches the layout load_episodes() expects.
 """
 
 from __future__ import annotations
@@ -135,6 +140,17 @@ def _process_scene(
 
     manifest_entries: list[dict] = []
 
+    # Build a fast object_id → target_label lookup for the whole scene.
+    # Mirrors LSS's _semantic_label logic: for catch-all nyu40 bins, prefer raw_label.
+    _NYU40_CATCHALL = {"otherprop", "otherfurniture", "otherstructure"}
+    def _target_label(obj_metadata: dict) -> str:
+        nyu40 = (obj_metadata.get("nyu40_label") or "").lower().strip()
+        if nyu40 in _NYU40_CATCHALL:
+            return (obj_metadata.get("raw_label") or nyu40).lower().strip()
+        return nyu40 or (obj_metadata.get("raw_label") or "").lower().strip()
+
+    obj_label_map = {o.id: _target_label(o.metadata) for o in scene_graph.objects}
+
     for idx, stmt in enumerate(sampled):
         episode_id = f"{scene.scene_id}_{idx:07d}"
         ep_dir = scene_out / episode_id
@@ -156,6 +172,7 @@ def _process_scene(
             "episode_id":       episode_id,
             "scene_id":         scene.scene_id,
             "target_object_id": stmt.target_object_id,
+            "target_label":     obj_label_map.get(stmt.target_object_id, ""),
             "target_xyz":       query.target_xyz.tolist(),
             "target_bbox":      query.target_bbox.tolist() if query.target_bbox is not None else None,
             "utterances": [
