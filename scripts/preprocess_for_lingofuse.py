@@ -40,6 +40,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from data.vla3d.dataset import VLA3DScene
+from language_spatial_sensor.core.ontology import VALID_RELATIONS
 from language_spatial_sensor.core.transforms import build_spatial_query
 
 
@@ -106,6 +107,8 @@ def _process_scene(
     filtered = []
     for stmt in statements:
         if not (ambiguity_min <= stmt.ambiguity <= ambiguity_max):
+            continue
+        if stmt.relation not in VALID_RELATIONS:
             continue
         if target_labels:
             target_obj = next((o for o in scene_graph.objects if o.id == stmt.target_object_id), None)
