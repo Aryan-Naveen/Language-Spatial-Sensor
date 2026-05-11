@@ -125,7 +125,14 @@ def _process_scene(
         print(f"  [skip] {scene.scene_id}: no statements match filters")
         return []
 
-    sampled = rng.sample(filtered, min(n_samples, len(filtered)))
+    # Enforce unique target_object_id per scene: collapse statements that share
+    # a target down to a single (randomly chosen) representative, then sample.
+    by_target: dict = {}
+    for stmt in filtered:
+        by_target.setdefault(stmt.target_object_id, []).append(stmt)
+    unique_per_target = [rng.choice(group) for group in by_target.values()]
+
+    sampled = rng.sample(unique_per_target, min(n_samples, len(unique_per_target)))
 
     # ── Optionally load point cloud once per scene ────────────────────────────
     pc_xyz: np.ndarray | None = None

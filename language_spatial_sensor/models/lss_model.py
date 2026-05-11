@@ -144,6 +144,10 @@ class LSSModel(nn.Module):
     ):
         B, N, _ = obj_clip_features.shape
 
+        # ── 0. Optional: zero out bboxes ("no 3D geometry" ablation) ──────────
+        if self.cfg.zero_bboxes:
+            obj_bboxes = torch.zeros_like(obj_bboxes)
+
         # ── 1. Encode text (CLS token) ─────────────────────────────────────────
         text_cls = self.text_enc(text_input_ids, text_attention_mask)  # (B, D)
 
@@ -162,28 +166,35 @@ class LSSModel(nn.Module):
         # ── 4. Spatial refinement backbone (e.g. ViSTA) ───────────────────────
         obj_feat = self.backbone(obj_feat_vis, spatial_rel, obj_padding_mask)  # (B, N, D)
 
-        # ── 5. Prepend text CLS and add modality tag ───────────────────────────
-        text_feat = text_cls.unsqueeze(1)                              # (B, 1, D)
-        text_feat = text_feat + self.modality_embed.weight[self._MODALITY_TEXT]
+        # ── 5/6/7. Fusion + pool → scene-text context vector ──────────────────
+        if self.cfg.use_global_fusion:
+            text_feat = text_cls.unsqueeze(1)                          # (B, 1, D)
+            text_feat = text_feat + self.modality_embed.weight[self._MODALITY_TEXT]
 
-        seq = torch.cat([text_feat, obj_feat], dim=1)                  # (B, 1+N, D)
+            seq = torch.cat([text_feat, obj_feat], dim=1)              # (B, 1+N, D)
 
-        # Extend padding mask: text token is never padded
-        text_valid   = torch.zeros(B, 1, dtype=torch.bool, device=seq.device)
-        fusion_mask  = torch.cat([text_valid, obj_padding_mask], dim=1)  # (B, 1+N)
+            text_valid  = torch.zeros(B, 1, dtype=torch.bool, device=seq.device)
+            fusion_mask = torch.cat([text_valid, obj_padding_mask], dim=1)  # (B, 1+N)
 
-        # ── 5b. Inject target-query token (pooling_type="query_token") ────────
-        # Sequence becomes [text_CLS, Q_target, obj_1, …, obj_N]; the query
-        # cross-attends to text + objects during fusion and its post-fusion state
-        # replaces the usual pooled vector.
-        if hasattr(self.pool, "prepend"):
-            seq, fusion_mask = self.pool.prepend(seq, fusion_mask)
+            # Inject target-query token (pooling_type="query_token") — sequence
+            # becomes [text_CLS, Q_target, obj_1, …, obj_N]; the query cross-
+            # attends to text + objects during fusion and its post-fusion state
+            # replaces the usual pooled vector.
+            if hasattr(self.pool, "prepend"):
+                seq, fusion_mask = self.pool.prepend(seq, fusion_mask)
 
-        # ── 6. Global fusion ───────────────────────────────────────────────────
-        seq = self.fusion(seq, fusion_mask)                             # (B, S, D)
-
-        # ── 7. Pool → scene-text context vector ───────────────────────────────
-        ctx_pool = self.pool(seq, fusion_mask)                          # (B, D)
+            seq = self.fusion(seq, fusion_mask)                        # (B, S, D)
+            ctx_pool = self.pool(seq, fusion_mask)                     # (B, D)
+        else:
+            # "No global fusion" ablation: pool object features alone, then add
+            # text CLS to the pooled vector. query_token pooling depends on the
+            # fusion transformer to contextualise its slot, so it's disallowed.
+            if hasattr(self.pool, "prepend"):
+                raise ValueError(
+                    "use_global_fusion=False is incompatible with "
+                    "pooling_type='query_token'. Use 'mean' | 'max' | 'attention'."
+                )
+            ctx_pool = self.pool(obj_feat, obj_padding_mask) + text_cls  # (B, D)
 
         # ── 7b. FiLM conditioning (region scale/shift → γ*ctx + β) ────────────
         if self.film is not None:

@@ -131,6 +131,28 @@ class SpatialEncoderLayer(nn.Module):
         return x
 
 
+@BACKBONE_REGISTRY.register("identity")
+class IdentityBackbone(nn.Module):
+    """Pass-through backbone for the 'no spatial backbone' ablation.
+
+    Returns object features unchanged, ignoring pairwise spatial relations and
+    the padding mask. Tests whether the explicit ViSTA-style spatial bias is
+    pulling its weight, or whether the global fusion transformer alone can
+    learn geometry from raw bbox tokens.
+    """
+
+    def __init__(self, cfg: LSSConfig) -> None:  # noqa: ARG002
+        super().__init__()
+
+    def forward(
+        self,
+        obj_features: torch.Tensor,                       # (B, N, D)
+        spatial_relations: torch.Tensor,                  # (B, N, N, R) — unused
+        key_padding_mask: torch.Tensor | None = None,     # (B, N)        — unused
+    ) -> torch.Tensor:                                    # (B, N, D)
+        return obj_features
+
+
 @BACKBONE_REGISTRY.register("scene_spatial")
 class SceneSpatialEncoder(nn.Module):
     """Stack of ViSTAEncoderLayers.

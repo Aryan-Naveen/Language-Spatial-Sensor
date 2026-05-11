@@ -34,6 +34,13 @@ num_spatial_layers: 3
 num_fusion_layers: 3
 num_heads: 8
 ffn_dim: 1024
+# Ablation switch: skip the GlobalFusionTransformer; pool object features alone
+# and add the text CLS to the pooled vector. Incompatible with pooling_type=query_token.
+use_global_fusion: true
+
+# Ablation switch: zero out obj_bboxes before computing pairwise spatial features
+# and anchor-centric offsets. Symmetric counterpart to a "no language" ablation.
+zero_bboxes: false
 
 # ── Pooling ───────────────────────────────────────────────────────────────────
 # mean | max | attention | query_token

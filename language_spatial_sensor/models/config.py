@@ -52,7 +52,18 @@ class LSSConfig:
     # ── Global fusion transformer ─────────────────────────────────────────────
     num_fusion_layers: int = 3
     num_heads: int = 8
-    ffn_dim: int = 1024              # feed-forward dim in all transformer layers
+    ffn_dim: int = 1024
+    # Ablation switch: skip the GlobalFusionTransformer entirely. Object features
+    # are pooled alone and the text CLS is added to the pooled vector before the
+    # head. Incompatible with pooling_type='query_token' (the query token has
+    # nothing to attend through without fusion).
+    use_global_fusion: bool = True
+
+    # Ablation switch: zero out object bboxes (centres + sizes) before computing
+    # pairwise spatial features and anchor-centric offsets. Symmetric counterpart
+    # to a "no language" ablation — both spatial bias and anchor-centric deltas
+    # collapse to constants, so the model must rely on CLIP features + role tag.
+    zero_bboxes: bool = False              # feed-forward dim in all transformer layers
 
     # ── Pooling ───────────────────────────────────────────────────────────────
     # "mean" | "max" | "attention" | "query_token"
